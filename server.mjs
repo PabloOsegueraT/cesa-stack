@@ -4,6 +4,7 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import { pool } from './db.mjs';
+import crypto from 'crypto';
 
 const app = express();
 
@@ -17,7 +18,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'x-role', 'x-user-id'],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
 }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '30mb' }));
 
 // Logger simple
 app.use((req, _res, next) => {
@@ -586,6 +587,135 @@ api.get('/tasks/my', requireAnyAuthenticated, async (req, res) => {
   // Reutilizamos la lógica de arriba
   req.url = '/my-tasks'; // truco sencillo
   return api.handle(req, res);
+});
+
+// ========================
+//  Evidencias de tareas (LONGBLOB)
+// ========================
+
+// GET /api/tasks/:id/attachments
+// Lista las evidencias de una tarea (sin devolver el binario)
+api.get('/tasks/:id/attachments', requireAnyAuthenticated, async (req, res) => {
+  const taskId = Number(req.params.id);
+  if (!taskId) {
+    return res.status(400).json({ message: 'taskId inválido' });
+  }
+
+  try {
+    const [rows] = await pool.query(
+      `
+        SELECT
+          id,
+          task_id,
+          uploaded_by,
+          file_name,
+          mime_type,
+          size_bytes,
+          sha256,
+          created_at
+        FROM task_attachments
+        WHERE task_id = ?
+        ORDER BY created_at DESC
+      `,
+      [taskId]
+    );
+
+    const list = Array.isArray(rows) ? rows : [];
+    return res.json({ attachments: list });
+  } catch (e) {
+    console.error('Error listando evidencias:', e);
+    return res.status(500).json({ message: 'Error al listar evidencias' });
+  }
+});
+
+// POST /api/tasks/:id/attachments
+// Body JSON: { fileName, mimeType, base64Data }
+api.post('/tasks/:id/attachments', requireAnyAuthenticated, async (req, res) => {
+  const taskId = Number(req.params.id);
+  const userId = req.authUserId;
+
+  if (!taskId) {
+    return res.status(400).json({ message: 'taskId inválido' });
+  }
+
+  const { fileName, mimeType, base64Data } = req.body ?? {};
+
+  if (!fileName || !mimeType || !base64Data) {
+    return res.status(400).json({
+      message: 'fileName, mimeType y base64Data son requeridos',
+    });
+  }
+
+  try {
+    // Convertir base64 -> Buffer
+    const buffer = Buffer.from(
+      base64Data.replace(/^data:[^;]+;base64,/, ''), // por si viene con prefijo data:
+      'base64'
+    );
+
+    const sizeBytes = buffer.length;
+    const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+
+    const [result] = await pool.query(
+      `
+        INSERT INTO task_attachments
+          (task_id, uploaded_by, file_data, file_name, mime_type, size_bytes, sha256)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `,
+      [taskId, userId, buffer, fileName, mimeType, sizeBytes, sha256]
+    );
+
+    return res.status(201).json({
+      id: result.insertId,
+      taskId,
+      uploadedBy: userId,
+      fileName,
+      mimeType,
+      sizeBytes,
+      sha256,
+      createdAt: new Date(),
+    });
+  } catch (e) {
+    console.error('Error creando evidencia:', e);
+    return res.status(500).json({ message: 'Error al crear evidencia' });
+  }
+});
+
+// GET /api/attachments/:id/download
+api.get('/attachments/:id/download', requireAnyAuthenticated, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) {
+    return res.status(400).json({ message: 'id inválido' });
+  }
+
+  try {
+    const [rows] = await pool.query(
+      `
+        SELECT file_data, file_name, mime_type
+        FROM task_attachments
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [id]
+    );
+
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+      return res.status(404).json({ message: 'Archivo no encontrado' });
+    }
+
+    const att = list[0];
+
+    res.setHeader('Content-Type', att.mime_type);
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${att.file_name}"`
+    );
+    return res.send(att.file_data);
+  } catch (e) {
+    console.error('Error descargando evidencia:', e);
+    return res.status(500).json({ message: 'Error al descargar evidencia' });
+  }
 });
 
 //* ========================
