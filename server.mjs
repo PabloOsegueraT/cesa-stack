@@ -707,6 +707,126 @@ api.get('/dashboard/summary', requireAdminOrRoot, async (req, res) => {
   }
 });
 
+/* ========================
+ *  Dashboard (resumen tareas)
+ * ====================== */
+
+// GET /api/dashboard/summary?year=2025&month=11
+// Si no mandas year/month, usa el mes actual.
+api.get('/dashboard/summary', requireAdminOrRoot, async (req, res) => {
+  try {
+    const now = new Date();
+    const year = Number(req.query.year) || now.getFullYear();
+    const month = Number(req.query.month) || (now.getMonth() + 1); // 1..12
+
+    const mm = String(month).padStart(2, '0');
+
+    // Rango del mes seleccionado [start, nextMonth)
+    const startDateStr = `${year}-${mm}-01`;
+    const nextMonth = month === 12 ? 1 : month + 1;
+    const nextYear = month === 12 ? year + 1 : year;
+    const nextMm = String(nextMonth).padStart(2, '0');
+    const endDateStr = `${nextYear}-${nextMm}-01`;
+
+    // 1) Conteo por estado (para tasks con due_date en ese mes)
+    const [statusRows] = await pool.query(
+      `
+        SELECT t.current_status_id AS status_id, COUNT(*) AS count
+        FROM tasks t
+        WHERE t.archived = 0
+          AND t.due_date IS NOT NULL
+          AND t.due_date >= ?
+          AND t.due_date < ?
+        GROUP BY t.current_status_id
+      `,
+      [startDateStr, endDateStr]
+    );
+
+    let total = 0;
+    let pending = 0;
+    let inProgress = 0;
+    let done = 0;
+
+    const statusList = Array.isArray(statusRows) ? statusRows : [];
+    for (const r of statusList) {
+      const c = Number(r.count) || 0;
+      total += c;
+
+      const code = STATUS_CODES[r.status_id] || 'pending';
+      if (code === 'pending') pending = c;
+      else if (code === 'in_progress') inProgress = c;
+      else if (code === 'done') done = c;
+    }
+
+    // 2) Conteo por prioridad (mismo rango)
+    const [priorityRows] = await pool.query(
+      `
+        SELECT t.priority_id AS priority_id, COUNT(*) AS count
+        FROM tasks t
+        WHERE t.archived = 0
+          AND t.due_date IS NOT NULL
+          AND t.due_date >= ?
+          AND t.due_date < ?
+        GROUP BY t.priority_id
+      `,
+      [startDateStr, endDateStr]
+    );
+
+    let low = 0;
+    let medium = 0;
+    let high = 0;
+
+    const prioList = Array.isArray(priorityRows) ? priorityRows : [];
+    for (const r of prioList) {
+      const c = Number(r.count) || 0;
+      const code = PRIORITY_CODES[r.priority_id] || 'medium';
+      if (code === 'low') low = c;
+      else if (code === 'medium') medium = c;
+      else if (code === 'high') high = c;
+    }
+
+    // 3) Tareas que vencen en las próximas 48 horas (pendientes / en proceso)
+    const [dueSoonRows] = await pool.query(
+      `
+        SELECT COUNT(*) AS c
+        FROM tasks t
+        WHERE t.archived = 0
+          AND t.due_date IS NOT NULL
+          AND t.due_date >= CURDATE()
+          AND t.due_date <= DATE_ADD(NOW(), INTERVAL 2 DAY)
+          AND t.current_status_id IN (?, ?)
+      `,
+      [STATUS_IDS.pending, STATUS_IDS.in_progress]
+    );
+    const dueSoon48h =
+      Array.isArray(dueSoonRows) && dueSoonRows.length
+        ? Number(dueSoonRows[0].c) || 0
+        : 0;
+
+    return res.json({
+      period: { year, month },
+      totals: {
+        total,
+        pending,
+        inProgress,
+        done,
+      },
+      priorities: {
+        low,
+        medium,
+        high,
+      },
+      dueSoon48h,
+    });
+  } catch (err) {
+    console.error('Error en /dashboard/summary:', err);
+    return res
+      .status(500)
+      .json({ message: 'Error al obtener resumen de dashboard' });
+  }
+});
+
+
 
 /* ========================
  *  Foros (admin / root + chat)
