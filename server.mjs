@@ -32,6 +32,7 @@ const api = express.Router();
  * ====================== */
 api.get('/health', (_req, res) => res.json({ ok: true }));
 
+// Login básico: devuelve { user: { id, name, email, role } }
 api.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body ?? {};
@@ -78,7 +79,7 @@ function requireRoot(req, res, next) {
   next();
 }
 
-// Para rutas donde root o admin pueden entrar (por ejemplo foros)
+// Para rutas donde root o admin pueden entrar (por ejemplo foros, tareas admin)
 function requireAdminOrRoot(req, res, next) {
   const role = String(req.header('x-role') || '').toLowerCase();
   if (role !== 'root' && role !== 'admin') {
@@ -239,43 +240,51 @@ api.put('/users/:id/password', requireRoot, async (req, res) => {
 });
 
 /* ========================
- *  Constantes de tareas
- *  (AJUSTA LOS IDs A TU BD)
+ *  Mapeos de tareas (IDs reales de tu BD)
  * ====================== */
 
-// OJO: estos IDs deben coincidir con tu tabla "priorities"
-const PRIORITY_MAP = {
-  low: 1,    // prioridad baja
-  medium: 2, // prioridad media
-  high: 3,   // prioridad alta
+// task_status.id
+// 1 = pendiente
+// 2 = en_proceso
+// 3 = completada
+// 4 = no_lograda
+const STATUS_IDS = {
+  pending: 1,
+  in_progress: 2,
+  done: 3,
 };
 
-const PRIORITY_ID_TO_CODE = {
+// Para leer desde la BD (tasks.current_status_id -> código que usa Flutter)
+const STATUS_CODES = {
+  1: 'pending',
+  2: 'in_progress',
+  3: 'done',
+  4: 'done', // 'no_lograda' la tratamos como done por ahora
+};
+
+// priorities.id
+// 1 = baja
+// 2 = media
+// 3 = alta
+const PRIORITY_CODES = {
   1: 'low',
   2: 'medium',
   3: 'high',
 };
 
-// OJO: estos IDs deben coincidir con tu tabla "task_status"
-const STATUS_MAP = {
-  pending: 1,      // pendiente
-  in_progress: 2,  // en proceso
-  done: 3,         // completada
-};
-
-const STATUS_ID_TO_CODE = {
-  1: 'pending',
-  2: 'in_progress',
-  3: 'done',
+// Para insertar desde el body JSON de Flutter
+const PRIORITY_IDS = {
+  low: 1,
+  medium: 2,
+  high: 3,
 };
 
 /* ========================
  *  Tareas (admin / root + usuarios)
  * ====================== */
 
-// Listar todas las tareas (root / admin)
+// LISTAR TODAS LAS TAREAS (admin / root)
 // GET /api/tasks
-// Devuelve: { tasks: [ { id, title, description, dueDate, priority, status, assignee } ] }
 api.get('/tasks', requireAdminOrRoot, async (_req, res) => {
   try {
     const sql = `
@@ -283,35 +292,47 @@ api.get('/tasks', requireAdminOrRoot, async (_req, res) => {
         t.id,
         t.title,
         t.description,
-        t.due_date       AS dueDate,
+        t.due_date,
         t.priority_id,
         t.current_status_id,
-        u.name           AS assigneeName
+        COALESCE(u.name, 'Sin asignar') AS assignee_name,
+        (SELECT COUNT(*) FROM task_attachments att WHERE att.task_id = t.id) AS evidence_count,
+        (SELECT COUNT(*) FROM task_comments    c   WHERE c.task_id   = t.id) AS comments_count
       FROM tasks t
-      LEFT JOIN task_assignments ta
-        ON ta.task_id = t.id
-       AND ta.is_active = 1
-      LEFT JOIN users u
-        ON u.id = ta.user_id
+      LEFT JOIN task_assignments ta ON ta.task_id = t.id AND ta.is_active = 1
+      LEFT JOIN users          u  ON u.id  = ta.user_id
       WHERE t.archived = 0
       ORDER BY
-        t.due_date IS NULL ASC,
+        t.due_date IS NULL,
         t.due_date ASC,
         t.id DESC
     `;
 
     const [rows] = await pool.query(sql);
-    const rawList = Array.isArray(rows) ? rows : [];
+    const list = Array.isArray(rows) ? rows : [];
 
-    const tasks = rawList.map((r) => ({
-      id: r.id,
-      title: r.title,
-      description: r.description ?? '',
-      dueDate: r.dueDate, // 'YYYY-MM-DD' o null
-      priority: PRIORITY_ID_TO_CODE[r.priority_id] ?? 'medium',
-      status: STATUS_ID_TO_CODE[r.current_status_id] ?? 'pending',
-      assignee: r.assigneeName || 'Sin asignar',
-    }));
+    const tasks = list.map((r) => {
+      let dueDateStr = null;
+      if (r.due_date) {
+        // MySQL DATE -> JS Date
+        dueDateStr = r.due_date.toISOString().slice(0, 10); // 'YYYY-MM-DD'
+      }
+
+      const statusCode = STATUS_CODES[r.current_status_id] || 'pending';
+      const priorityCode = PRIORITY_CODES[r.priority_id] || 'medium';
+
+      return {
+        id: r.id,
+        title: r.title,
+        description: r.description || '',
+        dueDate: dueDateStr,
+        priority: priorityCode,           // 'low' | 'medium' | 'high'
+        status: statusCode,               // 'pending' | 'in_progress' | 'done'
+        assignee: r.assignee_name || 'Sin asignar',
+        evidenceCount: r.evidence_count ?? 0,
+        commentsCount: r.comments_count ?? 0,
+      };
+    });
 
     return res.json({ tasks });
   } catch (err) {
@@ -320,57 +341,7 @@ api.get('/tasks', requireAdminOrRoot, async (_req, res) => {
   }
 });
 
-// Listar mis tareas (cualquier usuario autenticado)
-// GET /api/my-tasks
-api.get('/my-tasks', requireAnyAuthenticated, async (req, res) => {
-  try {
-    const userId = req.authUserId;
-
-    const sql = `
-      SELECT
-        t.id,
-        t.title,
-        t.description,
-        t.due_date       AS dueDate,
-        t.priority_id,
-        t.current_status_id,
-        u.name           AS assigneeName
-      FROM tasks t
-      JOIN task_assignments ta
-        ON ta.task_id = t.id
-       AND ta.is_active = 1
-      JOIN users u
-        ON u.id = ta.user_id
-      WHERE
-        t.archived = 0
-        AND ta.user_id = ?
-      ORDER BY
-        t.due_date IS NULL ASC,
-        t.due_date ASC,
-        t.id DESC
-    `;
-
-    const [rows] = await pool.query(sql, [userId]);
-    const rawList = Array.isArray(rows) ? rows : [];
-
-    const tasks = rawList.map((r) => ({
-      id: r.id,
-      title: r.title,
-      description: r.description ?? '',
-      dueDate: r.dueDate,
-      priority: PRIORITY_ID_TO_CODE[r.priority_id] ?? 'medium',
-      status: STATUS_ID_TO_CODE[r.current_status_id] ?? 'pending',
-      assignee: r.assigneeName || 'Sin asignar',
-    }));
-
-    return res.json({ tasks });
-  } catch (err) {
-    console.error('Error listando mis tareas:', err);
-    return res.status(500).json({ message: 'Error al listar mis tareas' });
-  }
-});
-
-// Crear tarea (root / admin)
+// CREAR TAREA (admin / root)
 // POST /api/tasks
 // Body JSON:
 // {
@@ -384,7 +355,7 @@ api.post('/tasks', requireAdminOrRoot, async (req, res) => {
   try {
     const {
       title,
-      description = null,
+      description = '',
       priority = 'medium',
       dueDate = null,
       assigneeId = null,
@@ -394,13 +365,11 @@ api.post('/tasks', requireAdminOrRoot, async (req, res) => {
       return res.status(400).json({ message: 'title es requerido' });
     }
 
-    const priorityCode = String(priority).toLowerCase();
-    const priorityId = PRIORITY_MAP[priorityCode];
-    if (!priorityId) {
-      return res.status(400).json({ message: 'priority inválida (usa low|medium|high)' });
-    }
+    const priorityKey = String(priority).toLowerCase();
+    const priorityId = PRIORITY_IDS[priorityKey] || PRIORITY_IDS.medium;
+    const statusId = STATUS_IDS.pending;
 
-    const pendingStatusId = STATUS_MAP.pending;
+    // quién creó la tarea (simulado por header)
     const headerUserId = Number(req.header('x-user-id'));
     const createdBy = Number.isFinite(headerUserId) ? headerUserId : null;
 
@@ -408,57 +377,59 @@ api.post('/tasks', requireAdminOrRoot, async (req, res) => {
     try {
       await conn.beginTransaction();
 
-      // 1) Insertar la tarea
-      const [taskResult] = await conn.query(
+      // 1) Insertar task
+      const [result] = await conn.query(
         `
-        INSERT INTO tasks (title, description, priority_id, due_date, created_by, current_status_id)
-        VALUES (?, ?, ?, ?, ?, ?)
+          INSERT INTO tasks (title, description, priority_id, due_date, created_by, current_status_id)
+          VALUES (?, ?, ?, ?, ?, ?)
         `,
-        [title, description, priorityId, dueDate, createdBy, pendingStatusId]
+        [title, description, priorityId, dueDate, createdBy, statusId]
       );
+      const taskId = result.insertId;
 
-      const taskId = taskResult.insertId;
-      let assigneeName = null;
-
-      // 2) Asignación (opcional)
+      // 2) Asignar usuario si viene assigneeId
+      let assigneeName = 'Sin asignar';
       if (assigneeId) {
         await conn.query(
           `
-          INSERT INTO task_assignments (task_id, user_id)
-          VALUES (?, ?)
+            INSERT INTO task_assignments (task_id, user_id)
+            VALUES (?, ?)
           `,
           [taskId, assigneeId]
         );
 
-        const [userRows] = await conn.query(
+        const [uRows] = await conn.query(
           'SELECT name FROM users WHERE id = ? LIMIT 1',
           [assigneeId]
         );
-        const userList = Array.isArray(userRows) ? userRows : [];
-        if (userList.length) {
-          assigneeName = userList[0].name;
+        const uList = Array.isArray(uRows) ? uRows : [];
+        if (uList.length) {
+          assigneeName = uList[0].name;
         }
       }
 
-      // 3) Historial de estado
+      // 3) Historial de estado inicial
       await conn.query(
         `
-        INSERT INTO task_status_history (task_id, user_id, from_status_id, to_status_id)
-        VALUES (?, ?, NULL, ?)
+          INSERT INTO task_status_history (task_id, user_id, from_status_id, to_status_id)
+          VALUES (?, ?, NULL, ?)
         `,
-        [taskId, createdBy, pendingStatusId]
+        [taskId, createdBy, statusId]
       );
 
       await conn.commit();
 
+      // Respuesta alineada con Task.fromJson
       return res.status(201).json({
         id: taskId,
         title,
-        description: description ?? '',
+        description,
         dueDate,
-        priority: priorityCode,
+        priority: priorityKey,
         status: 'pending',
-        assignee: assigneeName || 'Sin asignar',
+        assignee: assigneeName,
+        evidenceCount: 0,
+        commentsCount: 0,
       });
     } catch (err) {
       await conn.rollback();
@@ -473,594 +444,105 @@ api.post('/tasks', requireAdminOrRoot, async (req, res) => {
   }
 });
 
-// Cambiar estado de una tarea (cualquier usuario autenticado)
+// CAMBIAR ESTADO DE TAREA (cualquier rol autenticado)
 // PUT /api/tasks/:id/status
-// Body JSON: { "status": "pending" | "in_progress" | "done" }
-api.put('/tasks/:id/status', requireAnyAuthenticated, async (req, res) => {
-  try {
-    const taskId = Number(req.params.id);
-    const { status } = req.body ?? {};
-    const userId = req.authUserId;
-
-    if (!taskId) {
-      return res.status(400).json({ message: 'id inválido' });
-    }
-
-    const statusCode = String(status || '').toLowerCase();
-    const newStatusId = STATUS_MAP[statusCode];
-    if (!newStatusId) {
-      return res.status(400).json({ message: 'status inválido (pending|in_progress|done)' });
-    }
-
-    const conn = await pool.getConnection();
-    try {
-      await conn.beginTransaction();
-
-      const [rows] = await conn.query(
-        'SELECT current_status_id FROM tasks WHERE id = ? FOR UPDATE',
-        [taskId]
-      );
-      const list = Array.isArray(rows) ? rows : [];
-      if (!list.length) {
-        await conn.rollback();
-        return res.status(404).json({ message: 'Tarea no encontrada' });
-      }
-
-      const currentStatusId = list[0].current_status_id;
-      if (currentStatusId === newStatusId) {
-        await conn.rollback();
-        return res.json({ ok: true, skipped: true });
-      }
-
-      const completedAt = statusCode === 'done' ? new Date() : null;
-
-      await conn.query(
-        `
-        UPDATE tasks
-        SET current_status_id = ?, completed_at = ?
-        WHERE id = ?
-        `,
-        [newStatusId, completedAt, taskId]
-      );
-
-      await conn.query(
-        `
-        INSERT INTO task_status_history (task_id, user_id, from_status_id, to_status_id)
-        VALUES (?, ?, ?, ?)
-        `,
-        [taskId, userId, currentStatusId, newStatusId]
-      );
-
-      await conn.commit();
-      return res.json({ ok: true });
-    } catch (err) {
-      await conn.rollback();
-      console.error('Error actualizando estado de tarea:', err);
-      return res.status(500).json({ message: 'Error al actualizar estado de tarea' });
-    } finally {
-      conn.release();
-    }
-  } catch (err) {
-    console.error('Error en PUT /tasks/:id/status:', err);
-    return res.status(500).json({ message: 'Error interno' });
-  }
-});
-
-/* ========================
- *  Helpers para tareas
- * ====================== */
-
-// OJO: aquí asumo que en tu tabla priorities los IDs son:
-// 1 = low, 2 = medium, 3 = high
-// y en task_status:
-// 1 = pending, 2 = in_progress, 3 = done
-// Ajusta estos valores si en tu BD están distintos.
-function priorityCodeToId(code) {
-  switch (String(code || '').toLowerCase()) {
-    case 'low':
-      return 1;
-    case 'high':
-      return 3;
-    case 'medium':
-    default:
-      return 2;
-  }
-}
-
-function statusCodeToId(code) {
-  switch (String(code || '').toLowerCase()) {
-    case 'pending':
-      return 1;
-    case 'in_progress':
-      return 2;
-    case 'done':
-      return 3;
-    default:
-      return 1;
-  }
-}
-
-/* ========================
- *  Tareas (solo admin / root)
- * ====================== */
-
-// GET /api/tasks  -> lista TODAS las tareas (admin/root)
-api.get('/tasks', requireAdminOrRoot, async (_req, res) => {
-  try {
-    const sql = `
-      SELECT
-        t.id,
-        t.title,
-        t.description,
-        t.due_date AS dueDate,
-        CASE t.priority_id
-          WHEN 1 THEN 'low'
-          WHEN 2 THEN 'medium'
-          WHEN 3 THEN 'high'
-          ELSE 'medium'
-        END AS priority,
-        CASE t.current_status_id
-          WHEN 1 THEN 'pending'
-          WHEN 2 THEN 'in_progress'
-          WHEN 3 THEN 'done'
-          ELSE 'pending'
-        END AS status,
-        COALESCE(u.name, 'Sin asignar') AS assignee,
-        (SELECT COUNT(*) FROM task_attachments att WHERE att.task_id = t.id) AS evidenceCount,
-        (SELECT COUNT(*) FROM task_comments c WHERE c.task_id = t.id) AS commentsCount
-      FROM tasks t
-      LEFT JOIN task_assignments ta
-        ON ta.task_id = t.id
-       AND ta.is_active = 1
-      LEFT JOIN users u
-        ON u.id = ta.user_id
-      WHERE t.archived = 0
-      ORDER BY t.due_date IS NULL, t.due_date ASC, t.id DESC
-    `;
-
-    const [rows] = await pool.query(sql);
-    const list = Array.isArray(rows) ? rows : [];
-    return res.json({ tasks: list });
-  } catch (err) {
-    console.error('Error listando tareas:', err);
-    return res.status(500).json({ message: 'Error al listar tareas' });
-  }
-});
-
-
-// POST /api/tasks  -> crea tarea + asignación
-// Body JSON esperado:
-// {
-//   "title": "Tarea X",
-//   "description": "texto opcional",
-//   "priority": "low|medium|high",
-//   "dueDate": "2025-11-18",   // opcional
-//   "assigneeId": 3            // id del usuario asignado (opcional)
-// }
-api.post('/tasks', requireAdminOrRoot, async (req, res) => {
-  try {
-    const {
-      title,
-      description = null,
-      priority = 'medium',
-      dueDate = null,
-      assigneeId = null,
-    } = req.body ?? {};
-
-    if (!title) {
-      return res.status(400).json({ message: 'title es requerido' });
-    }
-
-    const creatorIdHeader = Number(req.header('x-user-id'));
-    const createdBy = Number.isFinite(creatorIdHeader) ? creatorIdHeader : null;
-
-    const priorityId = priorityCodeToId(priority);
-    const statusId = statusCodeToId('pending');
-
-    const conn = await pool.getConnection();
-    try {
-      await conn.beginTransaction();
-
-      // 1) Insertar la tarea
-      const [taskResult] = await conn.query(
-        `
-        INSERT INTO tasks (title, description, priority_id, due_date, created_by, current_status_id)
-        VALUES (?, ?, ?, ?, ?, ?)
-        `,
-        [title, description, priorityId, dueDate || null, createdBy, statusId]
-      );
-
-      const taskId = taskResult.insertId;
-
-      // 2) Asignación (si viene assigneeId)
-      if (assigneeId) {
-        await conn.query(
-          `
-          INSERT INTO task_assignments (task_id, user_id)
-          VALUES (?, ?)
-          `,
-          [taskId, assigneeId]
-        );
-      }
-
-      // 3) Historial de estado
-      await conn.query(
-        `
-        INSERT INTO task_status_history (task_id, user_id, from_status_id, to_status_id)
-        VALUES (?, ?, ?, ?)
-        `,
-        [taskId, createdBy, null, statusId]
-      );
-
-      // 4) Recuperar la tarea recién creada con el mismo formato que GET /tasks
-      const [rows] = await conn.query(
-        `
-        SELECT
-          t.id,
-          t.title,
-          t.description,
-          t.due_date AS dueDate,
-          CASE t.priority_id
-            WHEN 1 THEN 'low'
-            WHEN 2 THEN 'medium'
-            WHEN 3 THEN 'high'
-            ELSE 'medium'
-          END AS priority,
-          CASE t.current_status_id
-            WHEN 1 THEN 'pending'
-            WHEN 2 THEN 'in_progress'
-            WHEN 3 THEN 'done'
-            ELSE 'pending'
-          END AS status,
-          COALESCE(u.name, 'Sin asignar') AS assignee,
-          (SELECT COUNT(*) FROM task_attachments att WHERE att.task_id = t.id) AS evidenceCount,
-          (SELECT COUNT(*) FROM task_comments c WHERE c.task_id = t.id) AS commentsCount
-        FROM tasks t
-        LEFT JOIN task_assignments ta
-          ON ta.task_id = t.id
-         AND ta.is_active = 1
-        LEFT JOIN users u
-          ON u.id = ta.user_id
-        WHERE t.id = ?
-        LIMIT 1
-        `,
-        [taskId]
-      );
-
-      await conn.commit();
-
-      const list = Array.isArray(rows) ? rows : [];
-      if (!list.length) {
-        // fallback por si algo raro pasa
-        return res.status(201).json({
-          id: taskId,
-          title,
-          description,
-          dueDate,
-          priority,
-          status: 'pending',
-          assignee: 'Sin asignar',
-          evidenceCount: 0,
-          commentsCount: 0,
-        });
-      }
-
-      return res.status(201).json(list[0]);
-    } catch (err) {
-      await conn.rollback();
-      console.error('Error creando tarea:', err);
-      return res.status(500).json({ message: 'Error al crear tarea' });
-    } finally {
-      conn.release();
-    }
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: 'Error interno' });
-  }
-});
-
-/* ========================
- *  Tareas (tasks)
- * ====================== */
-
-// Mapas simples de código -> id (AJUSTA ESTOS IDs a los de tu tabla real)
-const PRIORITY_IDS = {
-  low: 1,
-  medium: 2,
-  high: 3,
-};
-
-const STATUS_IDS = {
-  pending: 1,        // pendiente
-  in_progress: 2,    // en_proceso
-  done: 3,           // completada
-  failed: 4,         // no_lograda (si luego lo usas en el front)
-};
-
-// Helper para leer una tarea y devolverla en formato amigable al front
-async function fetchTaskById(taskId) {
-  const sql = `
-    SELECT
-      t.id,
-      t.title,
-      t.description,
-      t.due_date AS dueDate,
-      CASE t.priority_id
-        WHEN 1 THEN 'low'
-        WHEN 2 THEN 'medium'
-        WHEN 3 THEN 'high'
-        ELSE 'medium'
-      END AS priority,
-      CASE t.current_status_id
-        WHEN 1 THEN 'pending'
-        WHEN 2 THEN 'in_progress'
-        WHEN 3 THEN 'done'
-        WHEN 4 THEN 'failed'
-        ELSE 'pending'
-      END AS status,
-      COALESCE(u.name, 'Sin asignar') AS assignee,
-      (SELECT COUNT(*) FROM task_attachments ta2 WHERE ta2.task_id = t.id) AS evidenceCount,
-      (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id = t.id) AS commentsCount
-    FROM tasks t
-    LEFT JOIN task_assignments ta
-      ON ta.task_id = t.id AND ta.is_active = 1
-    LEFT JOIN users u
-      ON u.id = ta.user_id
-    WHERE t.id = ?
-    LIMIT 1
-  `;
-  const [rows] = await pool.query(sql, [taskId]);
-  const list = Array.isArray(rows) ? rows : [];
-  return list.length ? list[0] : null;
-}
-
-// Listar tareas (root / admin)
-api.get('/tasks', requireAdminOrRoot, async (_req, res) => {
-  try {
-    const sql = `
-      SELECT
-        t.id,
-        t.title,
-        t.description,
-        t.due_date AS dueDate,
-        CASE t.priority_id
-          WHEN 1 THEN 'low'
-          WHEN 2 THEN 'medium'
-          WHEN 3 THEN 'high'
-          ELSE 'medium'
-        END AS priority,
-        CASE t.current_status_id
-          WHEN 1 THEN 'pending'
-          WHEN 2 THEN 'in_progress'
-          WHEN 3 THEN 'done'
-          ELSE 'pending'
-        END AS status,
-        COALESCE(u.name, 'Sin asignar') AS assignee,
-        (SELECT COUNT(*) FROM task_attachments ta2 WHERE ta2.task_id = t.id) AS evidenceCount,
-        (SELECT COUNT(*) FROM task_comments tc WHERE tc.task_id = t.id) AS commentsCount
-      FROM tasks t
-      LEFT JOIN task_assignments ta
-        ON ta.task_id = t.id AND ta.is_active = 1
-      LEFT JOIN users u
-        ON u.id = ta.user_id
-      WHERE t.archived = 0
-      ORDER BY t.created_at DESC
-    `;
-    const [rows] = await pool.query(sql);
-    const list = Array.isArray(rows) ? rows : [];
-    return res.json({ tasks: list });
-  } catch (err) {
-    console.error('Error listando tareas:', err);
-    return res.status(500).json({ message: 'Error al listar tareas' });
-  }
-});
-
-// Crear tarea (root / admin)
-api.post('/tasks', requireAdminOrRoot, async (req, res) => {
-  const {
-    title,
-    description = null,
-    priority = 'medium', // 'low' | 'medium' | 'high'
-    dueDate = null,      // 'YYYY-MM-DD'
-    assigneeId = null,   // user_id de la BD
-  } = req.body ?? {};
-
-  if (!title) {
-    return res.status(400).json({ message: 'title es requerido' });
-  }
-
-  const priorityId = PRIORITY_IDS[priority];
-  if (!priorityId) {
-    return res.status(400).json({ message: `priority inválido: ${priority}` });
-  }
-
-  const statusId = STATUS_IDS.pending;
-  if (!statusId) {
-    return res.status(500).json({ message: 'Status pending no configurado' });
-  }
-
-  const createdByHeader = Number(req.header('x-user-id'));
-  const createdBy = Number.isFinite(createdByHeader) ? createdByHeader : null;
-
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    // Insertar la tarea
-    const [taskResult] = await conn.query(
-      `
-      INSERT INTO tasks (title, description, priority_id, due_date, created_by, current_status_id)
-      VALUES (?, ?, ?, ?, ?, ?)
-      `,
-      [title, description, priorityId, dueDate, createdBy, statusId]
-    );
-
-    const taskId = taskResult.insertId;
-
-    // Asignación (si viene assigneeId)
-    if (assigneeId) {
-      await conn.query(
-        `
-        INSERT INTO task_assignments (task_id, user_id)
-        VALUES (?, ?)
-        `,
-        [taskId, assigneeId]
-      );
-    }
-
-    // Historial de estado (entrada inicial)
-    await conn.query(
-      `
-      INSERT INTO task_status_history (task_id, user_id, from_status_id, to_status_id)
-      VALUES (?, ?, NULL, ?)
-      `,
-      [taskId, createdBy, statusId]
-    );
-
-    await conn.commit();
-
-    // Leer la tarea en formato DTO para el frontend
-    const row = await fetchTaskById(taskId);
-    if (!row) {
-      return res.status(500).json({ message: 'No se pudo recuperar la tarea creada' });
-    }
-
-    return res.status(201).json(row);
-  } catch (err) {
-    console.error('Error creando tarea:', err);
-    await conn.rollback();
-    return res.status(500).json({ message: 'Error al crear tarea' });
-  } finally {
-    conn.release();
-  }
-});
-
-// Actualizar estado de una tarea (cualquier usuario autenticado)
+// Body: { "status": "pending" | "in_progress" | "done" }
 api.put('/tasks/:id/status', requireAnyAuthenticated, async (req, res) => {
   const taskId = Number(req.params.id);
   const { status } = req.body ?? {};
   const userId = req.authUserId;
 
-  if (!taskId) {
-    return res.status(400).json({ message: 'taskId inválido' });
-  }
-  if (!status) {
-    return res.status(400).json({ message: 'status es requerido' });
+  if (!taskId || !status) {
+    return res.status(400).json({ message: 'taskId y status son requeridos' });
   }
 
-  const newStatusId = STATUS_IDS[status];
+  const statusKey = String(status).toLowerCase();
+  const newStatusId = STATUS_IDS[statusKey];
   if (!newStatusId) {
-    return res.status(400).json({ message: `status inválido: ${status}` });
+    return res.status(400).json({ message: 'status inválido' });
   }
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    // Obtener estado actual
-    const [currentRows] = await conn.query(
-      'SELECT current_status_id FROM tasks WHERE id = ? LIMIT 1',
+    // 1) Leer estado actual
+    const [rows] = await conn.query(
+      'SELECT current_status_id FROM tasks WHERE id = ? FOR UPDATE',
       [taskId]
     );
-    const currentList = Array.isArray(currentRows) ? currentRows : [];
-    if (!currentList.length) {
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
       await conn.rollback();
       return res.status(404).json({ message: 'Tarea no encontrada' });
     }
-    const fromStatusId = currentList[0].current_status_id;
+    const fromStatusId = list[0].current_status_id;
 
-    // Actualizar task
-    const completedAt =
-      status === 'done' ? new Date() : null;
+    // Si es el mismo, no hacemos nada
+    if (fromStatusId === newStatusId) {
+      await conn.rollback();
+      return res.json({ ok: true, noop: true });
+    }
 
+    // 2) Insertar histórico
     await conn.query(
       `
-      UPDATE tasks
-      SET current_status_id = ?, completed_at = ?
-      WHERE id = ?
-      `,
-      [newStatusId, completedAt, taskId]
-    );
-
-    // Insertar en historial
-    await conn.query(
-      `
-      INSERT INTO task_status_history (task_id, user_id, from_status_id, to_status_id)
-      VALUES (?, ?, ?, ?)
+        INSERT INTO task_status_history (task_id, user_id, from_status_id, to_status_id)
+        VALUES (?, ?, ?, ?)
       `,
       [taskId, userId, fromStatusId, newStatusId]
     );
 
+    // 3) Actualizar tasks.current_status_id (+ completed_at)
+    const completedAt =
+      newStatusId === STATUS_IDS.done ? new Date() : null;
+
+    await conn.query(
+      `
+        UPDATE tasks
+        SET current_status_id = ?, completed_at = ?
+        WHERE id = ?
+      `,
+      [newStatusId, completedAt, taskId]
+    );
+
     await conn.commit();
 
-    const row = await fetchTaskById(taskId);
-    if (!row) {
-      return res.status(500).json({ message: 'No se pudo recuperar la tarea actualizada' });
-    }
-
-    return res.json(row);
+    return res.json({ ok: true });
   } catch (err) {
-    console.error('Error actualizando estado de tarea:', err);
+    console.error('Error cambiando estado de tarea:', err);
     await conn.rollback();
-    return res.status(500).json({ message: 'Error al actualizar estado de tarea' });
+    return res.status(500).json({ message: 'Error al cambiar estado' });
   } finally {
     conn.release();
   }
 });
 
-// ========================
-//  Tareas del usuario actual (rol usuario)
-//  GET /api/tasks/my
-//  Requiere: x-role: 'usuario' | 'admin' | 'root' y x-user-id
-// ========================
-api.get('/tasks/my', requireAnyAuthenticated, async (req, res) => {
+// LISTAR MIS TAREAS (usuario actual)
+// GET /api/my-tasks
+api.get('/my-tasks', requireAnyAuthenticated, async (req, res) => {
   try {
-    const userId = req.authUserId; // viene del header x-user-id validado en requireAnyAuthenticated
+    const userId = req.authUserId;
 
     const sql = `
       SELECT
         t.id,
         t.title,
         t.description,
-        t.due_date       AS dueDate,
-        t.completed_at   AS completedAt,
-        t.archived,
-        -- prioridad en código ('low' | 'medium' | 'high')
-        CASE p.name
-          WHEN 'baja'  THEN 'low'
-          WHEN 'media' THEN 'medium'
-          WHEN 'alta'  THEN 'high'
-          ELSE 'medium'
-        END AS priority,
-        -- estado en código ('pending' | 'in_progress' | 'done')
-        CASE s.name
-          WHEN 'pendiente'   THEN 'pending'
-          WHEN 'en_proceso'  THEN 'in_progress'
-          WHEN 'completada'  THEN 'done'
-          ELSE 'pending'
-        END AS status,
-        u.name AS assignee,
-        COALESCE(e.evidence_count, 0)  AS evidenceCount,
-        COALESCE(c.comments_count, 0)  AS commentsCount
+        t.due_date,
+        t.priority_id,
+        t.current_status_id,
+        u.name AS assignee_name,
+        (SELECT COUNT(*) FROM task_attachments att WHERE att.task_id = t.id) AS evidence_count,
+        (SELECT COUNT(*) FROM task_comments    c   WHERE c.task_id   = t.id) AS comments_count
       FROM tasks t
-      JOIN priorities   p  ON p.id = t.priority_id
-      JOIN task_status  s  ON s.id = t.current_status_id
-      LEFT JOIN (
-        SELECT task_id, COUNT(*) AS evidence_count
-        FROM task_attachments
-        GROUP BY task_id
-      ) e ON e.task_id = t.id
-      LEFT JOIN (
-        SELECT task_id, COUNT(*) AS comments_count
-        FROM task_comments
-        GROUP BY task_id
-      ) c ON c.task_id = t.id
       JOIN task_assignments ta
         ON ta.task_id = t.id
        AND ta.is_active = 1
       JOIN users u
         ON u.id = ta.user_id
-      WHERE t.archived = 0
+      WHERE
+        t.archived = 0
         AND ta.user_id = ?
       ORDER BY
         t.due_date IS NULL,
@@ -1069,17 +551,45 @@ api.get('/tasks/my', requireAnyAuthenticated, async (req, res) => {
     `;
 
     const [rows] = await pool.query(sql, [userId]);
-    const list = Array.isArray(rows) ? rows : [];
+    const rawList = Array.isArray(rows) ? rows : [];
 
-    return res.json({ tasks: list });
+    const tasks = rawList.map((r) => {
+      let dueDateStr = null;
+      if (r.due_date) {
+        dueDateStr = r.due_date.toISOString().slice(0, 10);
+      }
+      const statusCode = STATUS_CODES[r.current_status_id] || 'pending';
+      const priorityCode = PRIORITY_CODES[r.priority_id] || 'medium';
+
+      return {
+        id: r.id,
+        title: r.title,
+        description: r.description ?? '',
+        dueDate: dueDateStr,
+        priority: priorityCode,
+        status: statusCode,
+        assignee: r.assignee_name || 'Sin asignar',
+        evidenceCount: r.evidence_count ?? 0,
+        commentsCount: r.comments_count ?? 0,
+      };
+    });
+
+    return res.json({ tasks });
   } catch (err) {
     console.error('Error listando mis tareas:', err);
-    return res.status(500).json({ message: 'Error al listar tareas del usuario' });
+    return res.status(500).json({ message: 'Error al listar mis tareas' });
   }
 });
 
+// Alias opcional: GET /api/tasks/my  -> mismo que /api/my-tasks
+api.get('/tasks/my', requireAnyAuthenticated, async (req, res) => {
+  // Reutilizamos la lógica de arriba
+  req.url = '/my-tasks'; // truco sencillo
+  return api.handle(req, res);
+});
+
 /* ========================
- *  Foros (admin / root)
+ *  Foros (admin / root + chat)
  * ====================== */
 
 // Crear foro
@@ -1091,10 +601,6 @@ api.get('/tasks/my', requireAnyAuthenticated, async (req, res) => {
 //   "isPublic": true/false,
 //   "memberEmails": ["alumno1@escuela.com", "alumno2@escuela.com"]
 // }
-//
-// Headers esperados (en dev):
-//   x-role: 'admin' o 'root'
-//   x-user-id: id numérico del usuario creador (opcional)
 api.post('/forums', requireAdminOrRoot, async (req, res) => {
   const {
     title,
@@ -1121,8 +627,8 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
     // 1) Insertar el foro
     const [forumResult] = await conn.query(
       `
-      INSERT INTO forums (title, description, is_public, created_by)
-      VALUES (?, ?, ?, ?)
+        INSERT INTO forums (title, description, is_public, created_by)
+        VALUES (?, ?, ?, ?)
       `,
       [title, description, isPublic ? 1 : 0, createdBy]
     );
@@ -1134,9 +640,9 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
     if (!isPublic && Array.isArray(memberEmails) && memberEmails.length > 0) {
       const [userRows] = await conn.query(
         `
-        SELECT id, email
-        FROM users
-        WHERE email IN (${memberEmails.map(() => '?').join(',')})
+          SELECT id, email
+          FROM users
+          WHERE email IN (${memberEmails.map(() => '?').join(',')})
         `,
         memberEmails
       );
@@ -1147,8 +653,8 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
         const values = userList.map((u) => [forumId, u.id]);
         await conn.query(
           `
-          INSERT INTO forum_members (forum_id, user_id)
-          VALUES ?
+            INSERT INTO forum_members (forum_id, user_id)
+            VALUES ?
           `,
           [values]
         );
@@ -1178,7 +684,6 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
 
 // Listar foros
 // GET /api/forums
-// Devuelve: { forums: [ { id, title, description, isPublic, messagesCount } ] }
 api.get('/forums', requireAdminOrRoot, async (_req, res) => {
   try {
     const sql = `
@@ -1204,9 +709,41 @@ api.get('/forums', requireAdminOrRoot, async (_req, res) => {
   }
 });
 
-/* ========================
- *  Mensajes de foro (chat)
- * ====================== */
+// Listar foros del usuario actual (públicos + privados donde es miembro)
+// GET /api/forums/my
+api.get('/forums/my', requireAnyAuthenticated, async (req, res) => {
+  try {
+    const userId = req.authUserId; // viene de requireAnyAuthenticated
+
+    const sql = `
+      SELECT
+        f.id,
+        f.title,
+        f.description,
+        f.is_public AS isPublic,
+        COUNT(fp.id) AS messagesCount
+      FROM forums f
+      LEFT JOIN forum_posts fp
+        ON fp.forum_id = f.id
+      LEFT JOIN forum_members fm
+        ON fm.forum_id = f.id
+      WHERE
+        f.is_public = 1           -- foros públicos
+        OR fm.user_id = ?         -- o foros privados donde soy miembro
+      GROUP BY
+        f.id, f.title, f.description, f.is_public
+      ORDER BY f.created_at DESC
+    `;
+
+    const [rows] = await pool.query(sql, [userId]);
+    const list = Array.isArray(rows) ? rows : [];
+
+    return res.json({ forums: list });
+  } catch (err) {
+    console.error('Error listando foros del usuario:', err);
+    return res.status(500).json({ message: 'Error al listar foros del usuario' });
+  }
+});
 
 // Listar mensajes de un foro
 // GET /api/forums/:id/posts
@@ -1271,8 +808,8 @@ api.post('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
     // Insertamos el mensaje
     const [insertResult] = await pool.query(
       `
-      INSERT INTO forum_posts (forum_id, user_id, body)
-      VALUES (?, ?, ?)
+        INSERT INTO forum_posts (forum_id, user_id, body)
+        VALUES (?, ?, ?)
       `,
       [forumId, userId, body]
     );
@@ -1282,17 +819,17 @@ api.post('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
     // Recuperamos el mensaje con todos los datos
     const [rows] = await pool.query(
       `
-      SELECT
-        fp.id,
-        u.name AS author,
-        fp.body AS text,
-        fp.created_at AS createdAt,
-        CASE WHEN r.name IN ('admin', 'root') THEN 1 ELSE 0 END AS isAdmin
-      FROM forum_posts fp
-      JOIN users u ON u.id = fp.user_id
-      JOIN roles r ON r.id = u.role_id
-      WHERE fp.id = ?
-      LIMIT 1
+        SELECT
+          fp.id,
+          u.name AS author,
+          fp.body AS text,
+          fp.created_at AS createdAt,
+          CASE WHEN r.name IN ('admin', 'root') THEN 1 ELSE 0 END AS isAdmin
+        FROM forum_posts fp
+        JOIN users u ON u.id = fp.user_id
+        JOIN roles r ON r.id = u.role_id
+        WHERE fp.id = ?
+        LIMIT 1
       `,
       [postId]
     );
