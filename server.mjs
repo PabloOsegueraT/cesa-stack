@@ -1109,21 +1109,25 @@ api.get('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
       return res.status(400).json({ message: 'forumId inválido' });
     }
 
-    const sql = `
-      SELECT
-        fp.id,
-        u.name AS author,
-        fp.body AS text,
-        fp.created_at AS createdAt,
-        CASE WHEN r.name IN ('admin', 'root') THEN 1 ELSE 0 END AS isAdmin
-      FROM forum_posts fp
-      JOIN users u ON u.id = fp.user_id
-      JOIN roles r ON r.id = u.role_id
-      WHERE fp.forum_id = ?
-      ORDER BY fp.created_at ASC
-    `;
+    const currentUserId = req.authUserId; // ← viene de requireAnyAuthenticated
 
-    const [rows] = await pool.query(sql, [forumId]);
+        const sql = `
+          SELECT
+            fp.id,
+            u.id AS authorId,
+            u.name AS author,
+            r.name AS role,
+            fp.body AS text,
+            fp.created_at AS createdAt,
+            CASE WHEN r.name IN ('admin', 'root') THEN 1 ELSE 0 END AS isAdmin
+          FROM forum_posts fp
+          JOIN users u ON u.id = fp.user_id
+          JOIN roles r ON r.id = u.role_id
+          WHERE fp.forum_id = ?
+          ORDER BY fp.created_at ASC
+        `;
+
+    const [rows] = await pool.query(sql, [currentUserId, forumId]);
     const list = Array.isArray(rows) ? rows : [];
 
     return res.json({ posts: list });
@@ -1171,23 +1175,25 @@ api.post('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
 
     const postId = insertResult.insertId;
 
-    // Recuperamos el mensaje con todos los datos
-    const [rows] = await pool.query(
-      `
-        SELECT
-          fp.id,
-          u.name AS author,
-          fp.body AS text,
-          fp.created_at AS createdAt,
-          CASE WHEN r.name IN ('admin', 'root') THEN 1 ELSE 0 END AS isAdmin
-        FROM forum_posts fp
-        JOIN users u ON u.id = fp.user_id
-        JOIN roles r ON r.id = u.role_id
-        WHERE fp.id = ?
-        LIMIT 1
-      `,
-      [postId]
-    );
+    // Recuperamos el mensaje con isMine + isAdmin
+        const [rows] = await pool.query(
+          `
+            SELECT
+              fp.id,
+              u.id AS authorId,          -- 🔹 NUEVO
+              u.name AS author,
+              r.name AS role,            -- 🔹 NUEVO
+              fp.body AS text,
+              fp.created_at AS createdAt,
+              CASE WHEN r.name IN ('admin', 'root') THEN 1 ELSE 0 END AS isAdmin
+            FROM forum_posts fp
+            JOIN users u ON u.id = fp.user_id
+            JOIN roles r ON r.id = u.role_id
+            WHERE fp.id = ?
+            LIMIT 1
+          `,
+          [postId]
+        );
 
     const list = Array.isArray(rows) ? rows : [];
     if (!list.length) {
