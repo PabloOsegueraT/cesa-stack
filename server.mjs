@@ -835,6 +835,51 @@ api.get('/attachments/:id/download', requireAnyAuthenticated, async (req, res) =
   }
 });
 
+// Descargar / visualizar UNA evidencia (SIN middleware de auth)
+api.get('/tasks/:taskId/attachments/:attId/file', async (req, res) => {
+  try {
+    const taskId = Number(req.params.taskId);
+    const attId  = Number(req.params.attId);
+
+    if (!taskId || !attId) {
+      return res.status(400).json({ message: 'ids inválidos' });
+    }
+
+    const [rows] = await pool.query(
+      `
+        SELECT
+          file_name   AS fileName,
+          mime_type   AS mimeType,
+          size_bytes  AS sizeBytes,
+          file_data   AS fileData
+        FROM task_attachments
+        WHERE id = ? AND task_id = ?
+        LIMIT 1
+      `,
+      [attId, taskId]
+    );
+
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+      return res.status(404).json({ message: 'Archivo no encontrado' });
+    }
+
+    const att = list[0];
+
+    res.setHeader('Content-Type', att.mimeType || 'application/octet-stream');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${String(att.fileName || 'archivo').replace(/"/g, '\\"')}"`
+    );
+
+    // Enviar binario
+    return res.end(att.fileData);
+  } catch (err) {
+    console.error('Error sirviendo evidencia:', err);
+    return res.status(500).json({ message: 'Error al descargar evidencia' });
+  }
+});
+
 //* ========================
  //*  Dashboard (resumen tareas)
  //* ====================== */
