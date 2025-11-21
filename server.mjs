@@ -1513,8 +1513,6 @@ api.get('/forums/my', requireAnyAuthenticated, async (req, res) => {
 
 // Listar mensajes de un foro
 // GET /api/forums/:id/posts
-// Listar mensajes de un foro
-// GET /api/forums/:id/posts
 api.get('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
   try {
     const forumId = Number(req.params.id);
@@ -1525,27 +1523,220 @@ api.get('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
     const sql = `
       SELECT
         fp.id,
-        u.id AS authorId,
-        u.name AS author,
-        r.name AS role,
-        fp.body AS text,
+        u.id       AS authorId,
+        u.name     AS author,
+        r.name     AS role,
+        fp.body    AS text,
         fp.created_at AS createdAt,
-        CASE WHEN r.name IN ('admin', 'root') THEN 1 ELSE 0 END AS isAdmin
+        CASE WHEN r.name IN ('admin','root') THEN 1 ELSE 0 END AS isAdmin,
+        fa.id         AS attId,
+        fa.file_name  AS attFileName,
+        fa.mime_type  AS attMimeType,
+        fa.size_bytes AS attSizeBytes
       FROM forum_posts fp
-      JOIN users u ON u.id = fp.user_id
-      JOIN roles r ON r.id = u.role_id
+      JOIN users u   ON u.id = fp.user_id
+      JOIN roles r   ON r.id = u.role_id
+      LEFT JOIN forum_attachments fa
+        ON fa.forum_post_id = fp.id
       WHERE fp.forum_id = ?
-      ORDER BY fp.created_at ASC
+      ORDER BY fp.created_at ASC, fa.created_at ASC
     `;
 
-    // 👇 SOLO usamos forumId, NADA DE currentUserId
     const [rows] = await pool.query(sql, [forumId]);
     const list = Array.isArray(rows) ? rows : [];
 
-    return res.json({ posts: list });
+    // Agrupar adjuntos por mensaje
+    const map = new Map(); // postId -> post
+    for (const r of list) {
+      let post = map.get(r.id);
+      if (!post) {
+        post = {
+          id: r.id,
+          authorId: r.authorId,
+          author: r.author,
+          role: r.role,
+          text: r.text || '',
+          createdAt: r.createdAt,
+          isAdmin: !!r.isAdmin,
+          attachments: [],
+        };
+        map.set(r.id, post);
+      }
+
+      if (r.attId) {
+        post.attachments.push({
+          id: r.attId,
+          fileName: r.attFileName,
+          mimeType: r.attMimeType,
+          sizeBytes: r.attSizeBytes,
+          // la app usará Env.apiBaseUrl + downloadUrl
+          downloadUrl: `/api/forums/attachments/${r.attId}/file`,
+        });
+      }
+    }
+
+    return res.json({ posts: Array.from(map.values()) });
   } catch (err) {
     console.error('Error listando posts del foro:', err);
     return res.status(500).json({ message: 'Error al listar mensajes' });
+  }
+});
+
+// Crear mensaje con archivo adjunto
+// POST /api/forums/:id/posts-with-file
+// Body JSON: { text?, fileName, mimeType, base64Data }
+api.post('/forums/:id/posts-with-file', requireAnyAuthenticated, async (req, res) => {
+  const forumId = Number(req.params.id);
+  const userId  = req.authUserId;
+  const {
+    text = '',
+    fileName,
+    mimeType,
+    base64Data,
+  } = req.body ?? {};
+
+  if (!forumId) {
+    return res.status(400).json({ message: 'forumId inválido' });
+  }
+  if (!fileName || !mimeType || !base64Data) {
+    return res.status(400).json({
+      message: 'fileName, mimeType y base64Data son requeridos',
+    });
+  }
+
+  try {
+    // Verificar que el foro exista
+    const [forumRows] = await pool.query(
+      'SELECT id FROM forums WHERE id = ? LIMIT 1',
+      [forumId]
+    );
+    if (!Array.isArray(forumRows) || forumRows.length === 0) {
+      return res.status(404).json({ message: 'Foro no encontrado' });
+    }
+
+    const body = text.toString().trim();
+
+    // Decodificar base64
+    const buffer = Buffer.from(
+      base64Data.replace(/^data:[^;]+;base64,/, ''),
+      'base64'
+    );
+    const sizeBytes = buffer.length;
+    const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+
+      // 1) Insertar post
+      const [postResult] = await conn.query(
+        `
+          INSERT INTO forum_posts (forum_id, user_id, body)
+          VALUES (?, ?, ?)
+        `,
+        [forumId, userId, body]
+      );
+      const postId = postResult.insertId;
+
+      // 2) Insertar attachment
+      const [attResult] = await conn.query(
+        `
+          INSERT INTO forum_attachments
+            (forum_post_id, uploaded_by, file_data, file_name, mime_type, size_bytes, sha256)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `,
+        [postId, userId, buffer, fileName, mimeType, sizeBytes, sha256]
+      );
+      const attId = attResult.insertId;
+
+      // 3) Info del autor
+      const [uRows] = await conn.query(
+        `
+          SELECT u.name, r.name AS role
+          FROM users u
+          JOIN roles r ON r.id = u.role_id
+          WHERE u.id = ?
+          LIMIT 1
+        `,
+        [userId]
+      );
+      const uList = Array.isArray(uRows) ? uRows : [];
+      const authorName = uList.length ? uList[0].name : 'Usuario';
+      const role = uList.length ? uList[0].role : 'usuario';
+
+      await conn.commit();
+
+      const isAdmin = ['admin', 'root'].includes(String(role).toLowerCase());
+
+      return res.status(201).json({
+        id: postId,
+        authorId: userId,
+        author: authorName,
+        role,
+        text: body,
+        createdAt: new Date().toISOString(),
+        isAdmin,
+        attachments: [
+          {
+            id: attId,
+            fileName,
+            mimeType,
+            sizeBytes,
+            downloadUrl: `/api/forums/attachments/${attId}/file`,
+          },
+        ],
+      });
+    } catch (err) {
+      await conn.rollback();
+      console.error('Error creando mensaje con archivo:', err);
+      return res.status(500).json({ message: 'Error al crear mensaje con archivo' });
+    } finally {
+      conn.release();
+    }
+  } catch (err) {
+    console.error('Error en /forums/:id/posts-with-file:', err);
+    return res.status(500).json({ message: 'Error interno' });
+  }
+});
+
+// GET /api/forums/attachments/:id/file
+api.get('/forums/attachments/:id/file', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) {
+      return res.status(400).json({ message: 'id inválido' });
+    }
+
+    const [rows] = await pool.query(
+      `
+        SELECT
+          file_name   AS fileName,
+          mime_type   AS mimeType,
+          size_bytes  AS sizeBytes,
+          file_data   AS fileData
+        FROM forum_attachments
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [id]
+    );
+
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+      return res.status(404).json({ message: 'Archivo no encontrado' });
+    }
+
+    const att = list[0];
+
+    res.setHeader('Content-Type', att.mimeType || 'application/octet-stream');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${String(att.fileName || 'archivo').replace(/"/g, '\\"')}"`
+    );
+    return res.end(att.fileData);
+  } catch (err) {
+    console.error('Error sirviendo adjunto de foro:', err);
+    return res.status(500).json({ message: 'Error al descargar adjunto' });
   }
 });
 
