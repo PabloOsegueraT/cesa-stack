@@ -1810,6 +1810,38 @@ api.post('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
   }
 });
 
+// DELETE /api/forums/:id  -> Solo root puede borrar el foro y sus mensajes
+api.delete('/forums/:id', async (req, res) => {
+  try {
+    const role = (req.headers['x-role'] || '').toString().toLowerCase();
+    const forumId = req.params.id;
+
+    // Solo root
+    if (role !== 'root') {
+      return res
+        .status(403)
+        .json({ message: 'Solo el usuario root puede eliminar foros.' });
+    }
+
+    // Si en tu esquema tienes ON DELETE CASCADE en posts/attachments,
+    // basta con borrar el foro. Si NO tienes cascade, borra primero posts/attachments.
+    // Ejemplo con CASCADE activado:
+    const [result] = await pool.execute(
+      'DELETE FROM forums WHERE id = ? LIMIT 1',
+      [forumId],
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'Foro no encontrado' });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Error borrando foro', err);
+    return res.status(500).json({ message: 'Error interno al eliminar foro' });
+  }
+});
+
 
 
 /* ========================
