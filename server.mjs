@@ -5,6 +5,11 @@ import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import { pool } from './db.mjs';
 import crypto from 'crypto';
+import multer from 'multer';
+import path from 'node:path';
+import fs from 'node:fs';
+
+
 
 const app = express();
 
@@ -25,6 +30,10 @@ app.use((req, _res, next) => {
   console.log(`${req.method} ${req.url}`);
   next();
 });
+
+
+// Servir archivos estáticos (avatares, etc.)
+app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
 const api = express.Router();
 
@@ -112,6 +121,36 @@ async function getRoleIdByName(name) {
   const list = Array.isArray(rows) ? rows : [];
   return list.length ? list[0].id : null;
 }
+
+/* ========================
+ *  Subida de avatar (multer)
+ * ====================== */
+
+const avatarsDir = process.env.AVATARS_DIR || path.join(process.cwd(), 'uploads', 'avatars');
+fs.mkdirSync(avatarsDir, { recursive: true });
+
+const avatarStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, avatarsDir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || '.jpg';
+    const base = `avatar_${req.authUserId || 'user'}_${Date.now()}`;
+    cb(null, base + ext);
+  },
+});
+
+const avatarUpload = multer({
+  storage: avatarStorage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith('image/')) {
+      return cb(new Error('Solo se permiten imágenes'));
+    }
+    cb(null, true);
+  },
+});
+
 
 /* ========================
  *  Catálogos
@@ -356,6 +395,86 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
     return res.status(500).json({ message: 'Error interno' });
   }
 });
+
+// POST /api/me/avatar  -> subir foto de perfil (archivo)
+api.post(
+  '/me/avatar',
+  requireAnyAuthenticated,
+  avatarUpload.single('avatar'),
+  async (req, res) => {
+    try {
+      const userId = req.authUserId;
+
+      if (!req.file) {
+        return res.status(400).json({ message: 'Archivo no recibido' });
+      }
+
+      const publicBase = process.env.PUBLIC_BASE_URL || '';
+      let avatarUrl;
+
+      if (publicBase) {
+        // Si tienes dominio tipo https://mi-api.com
+        const relative = path
+          .relative(process.cwd(), req.file.path)
+          .replace(/\\/g, '/');
+        avatarUrl = `${publicBase}/${relative}`;
+      } else {
+        // URL relativa (se sirve con app.use('/uploads', ...))
+        avatarUrl = `/uploads/avatars/${path.basename(req.file.path)}`;
+      }
+
+      // Guardar la URL en la BD
+      await pool.execute(
+        'UPDATE users SET avatar_url = ? WHERE id = ?',
+        [avatarUrl, userId]
+      );
+
+      // Devolver el usuario actualizado
+      const [rows] = await pool.execute(
+        `
+          SELECT
+            u.id,
+            u.name,
+            u.email,
+            u.phone,
+            u.about,
+            u.avatar_url,
+            u.is_active,
+            r.name AS role
+          FROM users u
+          JOIN roles r ON r.id = u.role_id
+          WHERE u.id = ?
+          LIMIT 1
+        `,
+        [userId]
+      );
+
+      const list = Array.isArray(rows) ? rows : [];
+      if (!list.length) {
+        return res.status(404).json({ message: 'Usuario no encontrado' });
+      }
+
+      const u = list[0];
+
+      return res.json({
+        user: {
+          id: u.id,
+          name: u.name,
+          email: u.email,
+          role: (u.role || '').toLowerCase(), // root | admin | usuario
+          phone: u.phone,
+          about: u.about,
+          avatar_url: u.avatar_url,
+          is_active: !!u.is_active,
+        },
+      });
+    } catch (err) {
+      console.error('Error en POST /me/avatar:', err);
+      return res.status(500).json({ message: 'Error al subir avatar' });
+    }
+  }
+);
+
 
 /* ========================
  *  Mapeos de tareas (IDs reales de tu BD)
