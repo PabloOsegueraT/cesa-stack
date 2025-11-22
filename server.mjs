@@ -636,6 +636,65 @@ api.put('/tasks/:id/status', requireAnyAuthenticated, async (req, res) => {
   }
 });
 
+// BORRAR TAREA (admin / root)
+// DELETE /api/tasks/:id
+api.delete('/tasks/:id', requireAdminOrRoot, async (req, res) => {
+  const taskId = Number(req.params.id);
+  if (!taskId) {
+    return res.status(400).json({ message: 'id inválido' });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // 1) Borrar evidencias
+    await conn.query(
+      'DELETE FROM task_attachments WHERE task_id = ?',
+      [taskId]
+    );
+
+    // 2) Borrar comentarios
+    await conn.query(
+      'DELETE FROM task_comments WHERE task_id = ?',
+      [taskId]
+    );
+
+    // 3) Borrar historial de estado
+    await conn.query(
+      'DELETE FROM task_status_history WHERE task_id = ?',
+      [taskId]
+    );
+
+    // 4) Borrar asignaciones
+    await conn.query(
+      'DELETE FROM task_assignments WHERE task_id = ?',
+      [taskId]
+    );
+
+    // 5) Borrar la tarea principal
+    const [result] = await conn.query(
+      'DELETE FROM tasks WHERE id = ? LIMIT 1',
+      [taskId]
+    );
+
+    if (!result.affectedRows) {
+      await conn.rollback();
+      return res.status(404).json({ message: 'Tarea no encontrada' });
+    }
+
+    await conn.commit();
+    // Puedes devolver 204 (sin body) o 200 con un JSON
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('Error borrando tarea:', err);
+    await conn.rollback();
+    return res.status(500).json({ message: 'Error al borrar tarea' });
+  } finally {
+    conn.release();
+  }
+});
+
 // LISTAR MIS TAREAS (usuario actual)
 // GET /api/my-tasks
 api.get('/my-tasks', requireAnyAuthenticated, async (req, res) => {
@@ -1839,6 +1898,70 @@ api.delete('/forums/:id', async (req, res) => {
   } catch (err) {
     console.error('Error borrando foro', err);
     return res.status(500).json({ message: 'Error interno al eliminar foro' });
+  }
+});
+
+// DELETE /api/tasks/:taskId/attachments/:attId
+// - root/admin: pueden borrar cualquier evidencia por id
+// - usuario: solo puede borrar evidencias que él subió (uploaded_by = userId)
+// DELETE /api/tasks/:taskId/attachments/:attId
+api.delete('/tasks/:taskId/attachments/:attId', requireAnyAuthenticated, async (req, res) => {
+  try {
+    const taskId = Number(req.params.taskId);
+    const attId  = Number(req.params.attId);
+    const userId = req.authUserId;
+    const role   = req.authRole; // 'root' | 'admin' | 'usuario'
+
+    if (!taskId || !attId) {
+      return res.status(400).json({ message: 'ids inválidos' });
+    }
+
+    console.log('DELETE attachment', { taskId, attId, userId, role });
+
+    // 1) Verificar que el adjunto exista
+    const [rows] = await pool.query(
+      `
+        SELECT uploaded_by
+        FROM task_attachments
+        WHERE id = ? AND task_id = ?
+        LIMIT 1
+      `,
+      [attId, taskId]
+    );
+
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+      // No existe el archivo
+      return res.status(404).json({ message: 'Archivo no encontrado' });
+    }
+
+    const ownerId = list[0].uploaded_by;
+
+    // 2) Solo root/admin o el dueño pueden borrar
+    if (role === 'usuario' && ownerId !== userId) {
+      // El archivo existe, pero no le pertenece a este usuario
+      return res.status(403).json({
+        message: 'No puedes eliminar esta evidencia (fue subida por otro usuario).',
+      });
+    }
+
+    // 3) Borrar el adjunto
+    const [result] = await pool.query(
+      `
+        DELETE FROM task_attachments
+        WHERE id = ? AND task_id = ?
+      `,
+      [attId, taskId]
+    );
+
+    console.log('DELETE attachment result:', result);
+
+    // Aunque por lógica debería ser 1 fila,
+    // si fuera 0 aquí, es un caso raro, pero no pasa nada grave.
+    return res.status(204).end();
+  } catch (err) {
+    console.error('Error borrando evidencia:', err);
+    return res.status(500).json({ message: 'Error al eliminar evidencia' });
   }
 });
 
