@@ -1844,20 +1844,19 @@ api.post('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
   }
 });
 
-// DELETE /api/forums/:id  -> Solo root puede borrar el foro y sus mensajes
-api.delete('/forums/:id', async (req, res) => {
-  try {
-    const role = (req.headers['x-role'] || '').toString().toLowerCase();
-    const forumId = req.params.id;
 
-    // Solo root
-    if (role !== 'root') {
-      return res
-        .status(403)
-        .json({ message: 'Solo el usuario root puede eliminar foros.' });
+// DELETE /api/forums/:id  -> Admin o root pueden borrar el foro
+api.delete('/forums/:id', requireAdminOrRoot, async (req, res) => {
+  try {
+    const forumId = Number(req.params.id);
+    if (!forumId) {
+      return res.status(400).json({ message: 'id inválido' });
     }
 
-    const [result] = await pool.execute('DELETE FROM forums WHERE id = ? LIMIT 1', [forumId]);
+    const [result] = await pool.execute(
+      'DELETE FROM forums WHERE id = ? LIMIT 1',
+      [forumId],
+    );
 
     if (result.affectedRows === 0) {
       return res.status(404).json({ message: 'Foro no encontrado' });
