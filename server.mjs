@@ -1,5 +1,4 @@
 // src/server.mjs
-// src/server.mjs
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -10,14 +9,10 @@ import multer from 'multer';
 import path from 'node:path';
 import fs from 'node:fs';
 
-
 /* ========================
  *  Configuración uploads (avatares)
  * ====================== */
 
-// ========================
-//  Configuración de uploads para avatares
-// ========================
 const avatarsDir =
   process.env.AVATARS_DIR || path.join(process.cwd(), 'uploads', 'avatars');
 
@@ -38,13 +33,32 @@ const avatarStorage = multer.diskStorage({
 const avatarUpload = multer({
   storage: avatarStorage,
   limits: {
-    fileSize: 15 * 1024 * 1024, // 15 MB por si tus fotos están grandes
+    fileSize: 15 * 1024 * 1024, // 15 MB
   },
   fileFilter: (_req, file, cb) => {
-    if (!file.mimetype.startsWith('image/')) {
-      return cb(new Error('Solo se permiten imágenes'));
+    const mime = file.mimetype || '';
+    const original = (file.originalname || '').toLowerCase();
+    console.log('MIME recibido en /me/avatar:', mime, 'archivo:', original);
+
+    // 1) Si viene como image/*, lo aceptamos directo
+    if (mime.startsWith('image/')) {
+      return cb(null, true);
     }
-    cb(null, true);
+
+    // 2) A veces llega como application/octet-stream en web:
+    //    validamos por extensión
+    const okExt =
+      original.endsWith('.jpg') ||
+      original.endsWith('.jpeg') ||
+      original.endsWith('.png') ||
+      original.endsWith('.gif') ||
+      original.endsWith('.webp');
+
+    if (okExt) {
+      return cb(null, true);
+    }
+
+    return cb(new Error('Solo se permiten imágenes'));
   },
 });
 
@@ -349,17 +363,11 @@ api.get('/me', requireAnyAuthenticated, async (req, res) => {
 });
 
 // PUT /api/me  -> actualizar perfil básico
-// Acepta avatar_url o avatarUrl en el body
+// (YA NO toca avatar_url, eso solo se maneja en POST /me/avatar)
 api.put('/me', requireAnyAuthenticated, async (req, res) => {
   try {
     const userId = req.authUserId;
     const { name, phone, about } = req.body ?? {};
-
-    // Permitimos ambos nombres de campo por compatibilidad
-    const avatarFromSnake = req.body?.avatar_url;
-    const avatarFromCamel = req.body?.avatarUrl;
-    const avatar_url =
-      (avatarFromSnake ?? avatarFromCamel ?? '').toString().trim() || null;
 
     if (!name || !String(name).trim()) {
       return res.status(400).json({ message: 'name es requerido' });
@@ -368,10 +376,10 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
     await pool.execute(
       `
         UPDATE users
-        SET name = ?, phone = ?, about = ?, avatar_url = ?
+        SET name = ?, phone = ?, about = ?
         WHERE id = ?
       `,
-      [String(name).trim(), phone || null, about || null, avatar_url, userId]
+      [String(name).trim(), phone || null, about || null, userId],
     );
 
     // Devolvemos el perfil actualizado
@@ -391,7 +399,7 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
         WHERE u.id = ?
         LIMIT 1
       `,
-      [userId]
+      [userId],
     );
 
     const list = Array.isArray(rows) ? rows : [];
@@ -425,7 +433,6 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
 api.post(
   '/me/avatar',
   requireAnyAuthenticated,
-  // envolvemos avatarUpload para poder capturar errores de multer
   (req, res, next) => {
     avatarUpload.single('avatar')(req, res, (err) => {
       if (err) {
@@ -467,7 +474,7 @@ api.post(
       // Guardar la URL en la BD
       await pool.execute(
         'UPDATE users SET avatar_url = ? WHERE id = ?',
-        [avatarUrl, userId]
+        [avatarUrl, userId],
       );
 
       // Devolver el usuario actualizado
@@ -487,7 +494,7 @@ api.post(
           WHERE u.id = ?
           LIMIT 1
         `,
-        [userId]
+        [userId],
       );
 
       const list = Array.isArray(rows) ? rows : [];
@@ -513,7 +520,7 @@ api.post(
       console.error('Error en POST /me/avatar:', err);
       return res.status(500).json({ message: 'Error al subir avatar' });
     }
-  }
+  },
 );
 
 /* ========================
