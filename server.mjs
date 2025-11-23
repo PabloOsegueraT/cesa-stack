@@ -171,6 +171,145 @@ async function getRoleIdByName(name) {
   return list.length ? list[0].id : null;
 }
 
+// ========================
+// Helpers de notificaciones
+// ========================
+
+// Obtener el id del tipo de notificación por nombre
+async function getNotificationTypeIdByName(name) {
+  const [rows] = await pool.execute(
+    'SELECT id FROM notification_types WHERE name = ? LIMIT 1',
+    [name],
+  );
+  const list = Array.isArray(rows) ? rows : [];
+  return list.length ? list[0].id : null;
+}
+
+/**
+ * Crea una notificación y sus destinatarios.
+ * - typeName: 'restablecer_contraseña'
+ * - title, body: textos a mostrar
+ * - createdBy: id del usuario que originó la notificación (o null si sistema)
+ * - recipients: array de user_id que recibirán la notificación
+ * - extra: { taskId, forumId } opcional
+ */
+async function createNotificationWithRecipients({
+  typeName,
+  title,
+  body,
+  createdBy = null,
+  recipients = [],
+  taskId = null,
+  forumId = null,
+}) {
+  if (!recipients.length) return;
+
+  const typeId = await getNotificationTypeIdByName(typeName);
+  if (!typeId) {
+    console.error('Tipo de notificación no encontrado:', typeName);
+    return;
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // 1) Insertar notificación
+    const [notifResult] = await conn.query(
+      `
+      INSERT INTO notifications (type_id, title, body, task_id, forum_id, created_by)
+      VALUES (?, ?, ?, ?, ?, ?)
+      `,
+      [typeId, title, body, taskId, forumId, createdBy],
+    );
+    const notificationId = notifResult.insertId;
+
+    // 2) Insertar destinatarios
+    const values = recipients.map((uid) => [notificationId, uid]);
+    await conn.query(
+      `
+      INSERT INTO notification_recipients (notification_id, user_id)
+      VALUES ?
+      `,
+      [values],
+    );
+
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    console.error('Error creando notificación:', err);
+  } finally {
+    conn.release();
+  }
+}
+
+// POST /api/auth/forgot
+// Body: { "email": "usuario@demo.com" }
+api.post('/auth/forgot', async (req, res) => {
+  try {
+    const { email } = req.body ?? {};
+    const cleanedEmail = (email ?? '').toString().trim();
+
+    if (!cleanedEmail) {
+      return res.status(400).json({ message: 'email es requerido' });
+    }
+
+    // Buscamos si el correo existe (para que el root tenga contexto)
+    const [userRows] = await pool.execute(
+      'SELECT id, name, email FROM users WHERE email = ? LIMIT 1',
+      [cleanedEmail],
+    );
+    const userList = Array.isArray(userRows) ? userRows : [];
+    const user = userList.length ? userList[0] : null;
+
+    // Buscamos todos los usuarios con rol root
+    const [rootRows] = await pool.execute(
+      `
+      SELECT u.id, u.name, u.email
+      FROM users u
+      JOIN roles r ON r.id = u.role_id
+      WHERE r.name = 'root'
+      `,
+    );
+    const roots = Array.isArray(rootRows) ? rootRows : [];
+
+    if (!roots.length) {
+      console.warn('No hay usuarios root configurados para notificar.');
+      // Aun así respondemos OK al cliente
+      return res.json({
+        ok: true,
+        message: 'Si el correo está registrado, el administrador revisará tu solicitud.',
+      });
+    }
+
+    // Texto de la notificación para root
+    const title = 'Solicitud de restablecimiento de contraseña';
+    const body = user
+      ? `El usuario "${user.name}" (${user.email}) solicitó ayuda para restablecer su contraseña.`
+      : `Se recibió una solicitud de restablecimiento de contraseña para el correo: ${cleanedEmail}`;
+
+    const recipientIds = roots.map((r) => r.id);
+
+    await createNotificationWithRecipients({
+      typeName: 'restablecer_contraseña',
+      title,
+      body,
+      createdBy: null,         // la genera el sistema
+      recipients: recipientIds,
+      taskId: null,
+      forumId: null,
+    });
+
+    return res.json({
+      ok: true,
+      message: 'Si el correo está registrado, el administrador revisará tu solicitud.',
+    });
+  } catch (err) {
+    console.error('Error en POST /auth/forgot:', err);
+    return res.status(500).json({ message: 'Error interno' });
+  }
+});
+
 /* ========================
  *  Catálogos
  * ====================== */
