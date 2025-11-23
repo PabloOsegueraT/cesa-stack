@@ -1,4 +1,5 @@
 // src/server.mjs
+// src/server.mjs
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -9,13 +10,21 @@ import multer from 'multer';
 import path from 'node:path';
 import fs from 'node:fs';
 
+
 /* ========================
  *  Configuración uploads (avatares)
  * ====================== */
 
-const avatarsDir = process.env.AVATARS_DIR || path.join(process.cwd(), 'uploads', 'avatars');
+// ========================
+//  Configuración de uploads para avatares
+// ========================
+const avatarsDir =
+  process.env.AVATARS_DIR || path.join(process.cwd(), 'uploads', 'avatars');
+
+// Nos aseguramos de que exista la carpeta
 fs.mkdirSync(avatarsDir, { recursive: true });
 
+// Storage de multer para guardar archivos en disco
 const avatarStorage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, avatarsDir),
   filename: (_req, file, cb) => {
@@ -25,9 +34,12 @@ const avatarStorage = multer.diskStorage({
   },
 });
 
+// Límite de tamaño y validación de tipo
 const avatarUpload = multer({
   storage: avatarStorage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  limits: {
+    fileSize: 15 * 1024 * 1024, // 15 MB por si tus fotos están grandes
+  },
   fileFilter: (_req, file, cb) => {
     if (!file.mimetype.startsWith('image/')) {
       return cb(new Error('Solo se permiten imágenes'));
@@ -323,7 +335,7 @@ api.get('/me', requireAnyAuthenticated, async (req, res) => {
         id: u.id,
         name: u.name,
         email: u.email,
-        role: (u.role || '').toLowerCase(), // 'root' | 'admin' | 'usuario'
+        role: (u.role || '').toLowerCase(), // root | admin | usuario
         phone: u.phone,
         about: u.about,
         avatar_url: u.avatar_url,
@@ -336,11 +348,18 @@ api.get('/me', requireAnyAuthenticated, async (req, res) => {
   }
 });
 
-// PUT /api/me  -> actualizar perfil básico (nombre, teléfono, about, avatar_url)
+// PUT /api/me  -> actualizar perfil básico
+// Acepta avatar_url o avatarUrl en el body
 api.put('/me', requireAnyAuthenticated, async (req, res) => {
   try {
     const userId = req.authUserId;
-    const { name, phone, about, avatar_url } = req.body ?? {};
+    const { name, phone, about } = req.body ?? {};
+
+    // Permitimos ambos nombres de campo por compatibilidad
+    const avatarFromSnake = req.body?.avatar_url;
+    const avatarFromCamel = req.body?.avatarUrl;
+    const avatar_url =
+      (avatarFromSnake ?? avatarFromCamel ?? '').toString().trim() || null;
 
     if (!name || !String(name).trim()) {
       return res.status(400).json({ message: 'name es requerido' });
@@ -352,10 +371,10 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
         SET name = ?, phone = ?, about = ?, avatar_url = ?
         WHERE id = ?
       `,
-      [name, phone || null, about || null, avatar_url || null, userId],
+      [String(name).trim(), phone || null, about || null, avatar_url, userId]
     );
 
-    // devolver perfil actualizado
+    // Devolvemos el perfil actualizado
     const [rows] = await pool.execute(
       `
         SELECT
@@ -372,12 +391,14 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
         WHERE u.id = ?
         LIMIT 1
       `,
-      [userId],
+      [userId]
     );
 
     const list = Array.isArray(rows) ? rows : [];
     if (!list.length) {
-      return res.status(404).json({ message: 'Usuario no encontrado' });
+      return res
+        .status(404)
+        .json({ message: 'Usuario no encontrado luego de actualizar' });
     }
 
     const u = list[0];
@@ -404,7 +425,23 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
 api.post(
   '/me/avatar',
   requireAnyAuthenticated,
-  avatarUpload.single('avatar'),
+  // envolvemos avatarUpload para poder capturar errores de multer
+  (req, res, next) => {
+    avatarUpload.single('avatar')(req, res, (err) => {
+      if (err) {
+        console.error('Error de multer en /me/avatar:', err);
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res
+            .status(400)
+            .json({ message: 'La imagen es demasiado grande (máx 15 MB)' });
+        }
+        return res
+          .status(400)
+          .json({ message: err.message || 'Error al procesar la imagen' });
+      }
+      next();
+    });
+  },
   async (req, res) => {
     try {
       const userId = req.authUserId;
@@ -417,16 +454,21 @@ api.post(
       let avatarUrl;
 
       if (publicBase) {
-        // Si tienes dominio tipo https://mi-api.com
-        const relative = path.relative(process.cwd(), req.file.path).replace(/\\/g, '/');
+        // URL absoluta: https://mi-api.com/uploads/avatars/...
+        const relative = path
+          .relative(process.cwd(), req.file.path)
+          .replace(/\\/g, '/');
         avatarUrl = `${publicBase}/${relative}`;
       } else {
-        // URL relativa (se sirve con app.use('/uploads', ...))
+        // URL relativa (la app debe anteponer Env.apiBaseUrl)
         avatarUrl = `/uploads/avatars/${path.basename(req.file.path)}`;
       }
 
       // Guardar la URL en la BD
-      await pool.execute('UPDATE users SET avatar_url = ? WHERE id = ?', [avatarUrl, userId]);
+      await pool.execute(
+        'UPDATE users SET avatar_url = ? WHERE id = ?',
+        [avatarUrl, userId]
+      );
 
       // Devolver el usuario actualizado
       const [rows] = await pool.execute(
@@ -445,7 +487,7 @@ api.post(
           WHERE u.id = ?
           LIMIT 1
         `,
-        [userId],
+        [userId]
       );
 
       const list = Array.isArray(rows) ? rows : [];
@@ -471,7 +513,7 @@ api.post(
       console.error('Error en POST /me/avatar:', err);
       return res.status(500).json({ message: 'Error al subir avatar' });
     }
-  },
+  }
 );
 
 /* ========================
