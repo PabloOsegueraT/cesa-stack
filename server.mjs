@@ -146,16 +146,6 @@ async function getRoleIdByName(name) {
 const avatarsDir = process.env.AVATARS_DIR || path.join(process.cwd(), 'uploads', 'avatars');
 fs.mkdirSync(avatarsDir, { recursive: true });
 
-const avatarStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, avatarsDir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.jpg';
-    const base = `avatar_${req.authUserId || 'user'}_${Date.now()}`;
-    cb(null, base + ext);
-  },
-});
 
 const avatarUpload = multer({
   storage: avatarStorage,
