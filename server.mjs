@@ -1956,13 +1956,10 @@ api.post('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
 });
 
 
-// DELETE /api/forums/:id  -> Admin o root pueden borrar el foro
+// DELETE /api/forums/:id  -> admin o root pueden borrar el foro y sus mensajes
 api.delete('/forums/:id', requireAdminOrRoot, async (req, res) => {
   try {
-    const forumId = Number(req.params.id);
-    if (!forumId) {
-      return res.status(400).json({ message: 'id inválido' });
-    }
+    const forumId = req.params.id;
 
     const [result] = await pool.execute(
       'DELETE FROM forums WHERE id = ? LIMIT 1',
