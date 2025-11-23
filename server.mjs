@@ -246,67 +246,90 @@ async function createNotificationWithRecipients({
 // POST /api/auth/forgot
 // Body: { "email": "usuario@demo.com" }
 api.post('/auth/forgot', async (req, res) => {
+  const { email } = req.body ?? {};
+  if (!email) {
+    return res.status(400).json({ message: 'email requerido' });
+  }
+
+  const conn = await pool.getConnection();
   try {
-    const { email } = req.body ?? {};
-    const cleanedEmail = (email ?? '').toString().trim();
+    await conn.beginTransaction();
 
-    if (!cleanedEmail) {
-      return res.status(400).json({ message: 'email es requerido' });
-    }
-
-    // Buscamos si el correo existe (para que el root tenga contexto)
-    const [userRows] = await pool.execute(
-      'SELECT id, name, email FROM users WHERE email = ? LIMIT 1',
-      [cleanedEmail],
+    // 1) Usuario que pidió el reset
+    const [rowsUser] = await conn.execute(
+      `SELECT id, name, email FROM users WHERE email = ?`,
+      [email]
     );
-    const userList = Array.isArray(userRows) ? userRows : [];
-    const user = userList.length ? userList[0] : null;
 
-    // Buscamos todos los usuarios con rol root
-    const [rootRows] = await pool.execute(
-      `
-      SELECT u.id, u.name, u.email
-      FROM users u
-      JOIN roles r ON r.id = u.role_id
-      WHERE r.name = 'root'
-      `,
-    );
-    const roots = Array.isArray(rootRows) ? rootRows : [];
-
-    if (!roots.length) {
-      console.warn('No hay usuarios root configurados para notificar.');
-      // Aun así respondemos OK al cliente
+    // Por seguridad, respondemos igual aunque no exista
+    if (rowsUser.length === 0) {
+      await conn.commit();
       return res.json({
         ok: true,
-        message: 'Si el correo está registrado, el administrador revisará tu solicitud.',
+        message: 'Si el correo existe en el sistema, se avisará al root.',
       });
     }
 
-    // Texto de la notificación para root
+    const user = rowsUser[0];
+
+    // 2) Todos los root
+    const [rowsRoot] = await conn.execute(
+      `SELECT u.id
+       FROM users u
+       JOIN roles r ON r.id = u.role_id
+       WHERE r.name = 'root'`
+    );
+
+    if (rowsRoot.length === 0) {
+      await conn.commit();
+      return res.json({ ok: true, message: 'No hay usuarios root configurados.' });
+    }
+
+    // 3) type_id para 'restablecer_contraseña'
+    const typeName = 'restablecer_contraseña';
+    let typeId;
+    const [rowsType] = await conn.execute(
+      `SELECT id FROM notification_types WHERE name = ?`,
+      [typeName]
+    );
+    if (rowsType.length === 0) {
+      const [insType] = await conn.execute(
+        `INSERT INTO notification_types (name) VALUES (?)`,
+        [typeName]
+      );
+      typeId = insType.insertId;
+    } else {
+      typeId = rowsType[0].id;
+    }
+
+    // 4) Crear la notificación
     const title = 'Solicitud de restablecimiento de contraseña';
-    const body = user
-      ? `El usuario "${user.name}" (${user.email}) solicitó ayuda para restablecer su contraseña.`
-      : `Se recibió una solicitud de restablecimiento de contraseña para el correo: ${cleanedEmail}`;
+    const body  = `El usuario "${user.name}" (${user.email}) solicitó restablecer su contraseña.`;
 
-    const recipientIds = roots.map((r) => r.id);
+    const [insNotif] = await conn.execute(
+      `INSERT INTO notifications
+         (type_id, title, body, created_at, task_id, forum_id, created_by)
+       VALUES
+         (?, ?, ?, NOW(), NULL, NULL, NULL)`,
+      [typeId, title, body]
+    );
+    const notifId = insNotif.insertId;
 
-    await createNotificationWithRecipients({
-      typeName: 'restablecer_contraseña',
-      title,
-      body,
-      createdBy: null,         // la genera el sistema
-      recipients: recipientIds,
-      taskId: null,
-      forumId: null,
-    });
+    // 5) Destinatarios: todos los root
+    const values = rowsRoot.map(r => `(${notifId}, ${r.id})`).join(',');
+    await conn.query(
+      `INSERT INTO notification_recipients (notification_id, user_id)
+       VALUES ${values}`
+    );
 
-    return res.json({
-      ok: true,
-      message: 'Si el correo está registrado, el administrador revisará tu solicitud.',
-    });
+    await conn.commit();
+    return res.json({ ok: true, message: 'Solicitud recibida. El root ha sido notificado.' });
   } catch (err) {
-    console.error('Error en POST /auth/forgot:', err);
+    await conn.rollback();
+    console.error('Error en /auth/forgot', err);
     return res.status(500).json({ message: 'Error interno' });
+  } finally {
+    conn.release();
   }
 });
 
