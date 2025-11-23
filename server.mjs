@@ -9,9 +9,11 @@ import multer from 'multer';
 import path from 'node:path';
 import fs from 'node:fs';
 
+/* ========================
+ *  Configuración uploads (avatares)
+ * ====================== */
 
-// === Configuración de uploads para avatares ===
-const avatarsDir = path.join(process.cwd(), 'uploads', 'avatars');
+const avatarsDir = process.env.AVATARS_DIR || path.join(process.cwd(), 'uploads', 'avatars');
 fs.mkdirSync(avatarsDir, { recursive: true });
 
 const avatarStorage = multer.diskStorage({
@@ -23,23 +25,39 @@ const avatarStorage = multer.diskStorage({
   },
 });
 
-const avatarUpload = multer({ storage: avatarStorage });
+const avatarUpload = multer({
+  storage: avatarStorage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  fileFilter: (_req, file, cb) => {
+    if (!file.mimetype.startsWith('image/')) {
+      return cb(new Error('Solo se permiten imágenes'));
+    }
+    cb(null, true);
+  },
+});
 
-// Servir archivos estáticos de /uploads
+/* ========================
+ *  App base
+ * ====================== */
+
 const app = express();
 
+// Servir archivos estáticos (avatares, etc.)
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
 /* ========================
  *  Middlewares base
  * ====================== */
+
 const allowOrigin = process.env.CORS_ALLOW_ORIGIN || '*';
-app.use(cors({
-  origin: allowOrigin,
-  credentials: false,
-  allowedHeaders: ['Content-Type', 'x-role', 'x-user-id'],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
-}));
+app.use(
+  cors({
+    origin: allowOrigin,
+    credentials: false,
+    allowedHeaders: ['Content-Type', 'x-role', 'x-user-id'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  }),
+);
 app.use(express.json({ limit: '30mb' }));
 
 // Logger simple
@@ -48,15 +66,12 @@ app.use((req, _res, next) => {
   next();
 });
 
-
-// Servir archivos estáticos (avatares, etc.)
-app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
-
 const api = express.Router();
 
 /* ========================
  *  Rutas públicas
  * ====================== */
+
 api.get('/health', (_req, res) => res.json({ ok: true }));
 
 // Login básico: devuelve { user: { id, name, email, role } }
@@ -96,8 +111,7 @@ api.post('/auth/login', async (req, res) => {
  *  Helpers / Middlewares
  * ====================== */
 
-// En DEV usamos headers para simular autorización.
-// Cuando metas JWT real, reemplaza estos middlewares.
+// Solo root
 function requireRoot(req, res, next) {
   const role = String(req.header('x-role') || '').toLowerCase();
   if (role !== 'root') {
@@ -106,7 +120,7 @@ function requireRoot(req, res, next) {
   next();
 }
 
-// Para rutas donde root o admin pueden entrar (por ejemplo foros, tareas admin)
+// Root o admin
 function requireAdminOrRoot(req, res, next) {
   const role = String(req.header('x-role') || '').toLowerCase();
   if (role !== 'root' && role !== 'admin') {
@@ -140,28 +154,9 @@ async function getRoleIdByName(name) {
 }
 
 /* ========================
- *  Subida de avatar (multer)
- * ====================== */
-
-const avatarsDir = process.env.AVATARS_DIR || path.join(process.cwd(), 'uploads', 'avatars');
-fs.mkdirSync(avatarsDir, { recursive: true });
-
-
-const avatarUpload = multer({
-  storage: avatarStorage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
-  fileFilter: (req, file, cb) => {
-    if (!file.mimetype.startsWith('image/')) {
-      return cb(new Error('Solo se permiten imágenes'));
-    }
-    cb(null, true);
-  },
-});
-
-
-/* ========================
  *  Catálogos
  * ====================== */
+
 api.get('/roles', async (_req, res) => {
   try {
     const [rows] = await pool.execute('SELECT id, name FROM roles ORDER BY id');
@@ -180,9 +175,12 @@ api.get('/roles', async (_req, res) => {
 api.post('/users', requireRoot, async (req, res) => {
   try {
     const {
-      name, email, password,
-      role = 'usuario',          // 'root' | 'admin' | 'usuario'
-      phone = null, about = null,
+      name,
+      email,
+      password,
+      role = 'usuario', // 'root' | 'admin' | 'usuario'
+      phone = null,
+      about = null,
       avatar_url = null,
       is_active = 1,
     } = req.body ?? {};
@@ -210,7 +208,7 @@ api.post('/users', requireRoot, async (req, res) => {
     const [result] = await pool.execute(
       `INSERT INTO users (role_id, name, email, password_hash, phone, about, avatar_url, is_active)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [roleId, name, email, hash, phone, about, avatar_url, is_active ? 1 : 0]
+      [roleId, name, email, hash, phone, about, avatar_url, is_active ? 1 : 0],
     );
 
     res.status(201).json({
@@ -222,8 +220,8 @@ api.post('/users', requireRoot, async (req, res) => {
         phone,
         about,
         avatar_url,
-        is_active: !!is_active
-      }
+        is_active: !!is_active,
+      },
     });
   } catch (e) {
     console.error(e);
@@ -295,26 +293,25 @@ api.get('/me', requireAnyAuthenticated, async (req, res) => {
   try {
     const userId = req.authUserId;
 
-    const [rows] = await pool.execute(
-      `
-        SELECT
-          u.id,
-          u.name,
-          u.email,
-          u.phone,
-          u.about,
-          u.avatar_url,
-          u.is_active,
-          r.name AS role
-        FROM users u
-        JOIN roles r ON r.id = u.role_id
-        WHERE u.id = ?
-        LIMIT 1
-      `,
-      [userId]
-    );
+    const sql = `
+      SELECT
+        u.id,
+        u.name,
+        u.email,
+        u.phone,
+        u.about,
+        u.avatar_url,
+        u.is_active,
+        r.name AS role
+      FROM users u
+      JOIN roles r ON r.id = u.role_id
+      WHERE u.id = ?
+      LIMIT 1
+    `;
 
+    const [rows] = await pool.execute(sql, [userId]);
     const list = Array.isArray(rows) ? rows : [];
+
     if (!list.length) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
@@ -339,11 +336,11 @@ api.get('/me', requireAnyAuthenticated, async (req, res) => {
   }
 });
 
-// PUT /api/me  -> actualizar SOLO nombre, teléfono y about
+// PUT /api/me  -> actualizar perfil básico (nombre, teléfono, about, avatar_url)
 api.put('/me', requireAnyAuthenticated, async (req, res) => {
   try {
     const userId = req.authUserId;
-    const { name, phone, about } = req.body ?? {};
+    const { name, phone, about, avatar_url } = req.body ?? {};
 
     if (!name || !String(name).trim()) {
       return res.status(400).json({ message: 'name es requerido' });
@@ -352,13 +349,13 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
     await pool.execute(
       `
         UPDATE users
-        SET name = ?, phone = ?, about = ?
+        SET name = ?, phone = ?, about = ?, avatar_url = ?
         WHERE id = ?
       `,
-      [String(name).trim(), phone || null, about || null, userId]
+      [name, phone || null, about || null, avatar_url || null, userId],
     );
 
-    // Devolvemos el perfil actualizado
+    // devolver perfil actualizado
     const [rows] = await pool.execute(
       `
         SELECT
@@ -375,14 +372,12 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
         WHERE u.id = ?
         LIMIT 1
       `,
-      [userId]
+      [userId],
     );
 
     const list = Array.isArray(rows) ? rows : [];
     if (!list.length) {
-      return res
-        .status(404)
-        .json({ message: 'Usuario no encontrado luego de actualizar' });
+      return res.status(404).json({ message: 'Usuario no encontrado' });
     }
 
     const u = list[0];
@@ -423,9 +418,7 @@ api.post(
 
       if (publicBase) {
         // Si tienes dominio tipo https://mi-api.com
-        const relative = path
-          .relative(process.cwd(), req.file.path)
-          .replace(/\\/g, '/');
+        const relative = path.relative(process.cwd(), req.file.path).replace(/\\/g, '/');
         avatarUrl = `${publicBase}/${relative}`;
       } else {
         // URL relativa (se sirve con app.use('/uploads', ...))
@@ -433,10 +426,7 @@ api.post(
       }
 
       // Guardar la URL en la BD
-      await pool.execute(
-        'UPDATE users SET avatar_url = ? WHERE id = ?',
-        [avatarUrl, userId]
-      );
+      await pool.execute('UPDATE users SET avatar_url = ? WHERE id = ?', [avatarUrl, userId]);
 
       // Devolver el usuario actualizado
       const [rows] = await pool.execute(
@@ -455,7 +445,7 @@ api.post(
           WHERE u.id = ?
           LIMIT 1
         `,
-        [userId]
+        [userId],
       );
 
       const list = Array.isArray(rows) ? rows : [];
@@ -481,7 +471,7 @@ api.post(
       console.error('Error en POST /me/avatar:', err);
       return res.status(500).json({ message: 'Error al subir avatar' });
     }
-  }
+  },
 );
 
 /* ========================
@@ -571,8 +561,8 @@ api.get('/tasks', requireAdminOrRoot, async (_req, res) => {
         title: r.title,
         description: r.description || '',
         dueDate: dueDateStr,
-        priority: priorityCode,           // 'low' | 'medium' | 'high'
-        status: statusCode,               // 'pending' | 'in_progress' | 'done'
+        priority: priorityCode, // 'low' | 'medium' | 'high'
+        status: statusCode, // 'pending' | 'in_progress' | 'done'
         assignee: r.assignee_name || 'Sin asignar',
         evidenceCount: r.evidence_count ?? 0,
         commentsCount: r.comments_count ?? 0,
@@ -628,7 +618,7 @@ api.post('/tasks', requireAdminOrRoot, async (req, res) => {
           INSERT INTO tasks (title, description, priority_id, due_date, created_by, current_status_id)
           VALUES (?, ?, ?, ?, ?, ?)
         `,
-        [title, description, priorityId, dueDate, createdBy, statusId]
+        [title, description, priorityId, dueDate, createdBy, statusId],
       );
       const taskId = result.insertId;
 
@@ -640,13 +630,12 @@ api.post('/tasks', requireAdminOrRoot, async (req, res) => {
             INSERT INTO task_assignments (task_id, user_id)
             VALUES (?, ?)
           `,
-          [taskId, assigneeId]
+          [taskId, assigneeId],
         );
 
-        const [uRows] = await conn.query(
-          'SELECT name FROM users WHERE id = ? LIMIT 1',
-          [assigneeId]
-        );
+        const [uRows] = await conn.query('SELECT name FROM users WHERE id = ? LIMIT 1', [
+          assigneeId,
+        ]);
         const uList = Array.isArray(uRows) ? uRows : [];
         if (uList.length) {
           assigneeName = uList[0].name;
@@ -659,7 +648,7 @@ api.post('/tasks', requireAdminOrRoot, async (req, res) => {
           INSERT INTO task_status_history (task_id, user_id, from_status_id, to_status_id)
           VALUES (?, ?, NULL, ?)
         `,
-        [taskId, createdBy, statusId]
+        [taskId, createdBy, statusId],
       );
 
       await conn.commit();
@@ -714,7 +703,7 @@ api.put('/tasks/:id/status', requireAnyAuthenticated, async (req, res) => {
     // 1) Leer estado actual
     const [rows] = await conn.query(
       'SELECT current_status_id FROM tasks WHERE id = ? FOR UPDATE',
-      [taskId]
+      [taskId],
     );
     const list = Array.isArray(rows) ? rows : [];
     if (!list.length) {
@@ -735,12 +724,11 @@ api.put('/tasks/:id/status', requireAnyAuthenticated, async (req, res) => {
         INSERT INTO task_status_history (task_id, user_id, from_status_id, to_status_id)
         VALUES (?, ?, ?, ?)
       `,
-      [taskId, userId, fromStatusId, newStatusId]
+      [taskId, userId, fromStatusId, newStatusId],
     );
 
     // 3) Actualizar tasks.current_status_id (+ completed_at)
-    const completedAt =
-      newStatusId === STATUS_IDS.done ? new Date() : null;
+    const completedAt = newStatusId === STATUS_IDS.done ? new Date() : null;
 
     await conn.query(
       `
@@ -748,7 +736,7 @@ api.put('/tasks/:id/status', requireAnyAuthenticated, async (req, res) => {
         SET current_status_id = ?, completed_at = ?
         WHERE id = ?
       `,
-      [newStatusId, completedAt, taskId]
+      [newStatusId, completedAt, taskId],
     );
 
     await conn.commit();
@@ -776,34 +764,19 @@ api.delete('/tasks/:id', requireAdminOrRoot, async (req, res) => {
     await conn.beginTransaction();
 
     // 1) Borrar evidencias
-    await conn.query(
-      'DELETE FROM task_attachments WHERE task_id = ?',
-      [taskId]
-    );
+    await conn.query('DELETE FROM task_attachments WHERE task_id = ?', [taskId]);
 
     // 2) Borrar comentarios
-    await conn.query(
-      'DELETE FROM task_comments WHERE task_id = ?',
-      [taskId]
-    );
+    await conn.query('DELETE FROM task_comments WHERE task_id = ?', [taskId]);
 
     // 3) Borrar historial de estado
-    await conn.query(
-      'DELETE FROM task_status_history WHERE task_id = ?',
-      [taskId]
-    );
+    await conn.query('DELETE FROM task_status_history WHERE task_id = ?', [taskId]);
 
     // 4) Borrar asignaciones
-    await conn.query(
-      'DELETE FROM task_assignments WHERE task_id = ?',
-      [taskId]
-    );
+    await conn.query('DELETE FROM task_assignments WHERE task_id = ?', [taskId]);
 
     // 5) Borrar la tarea principal
-    const [result] = await conn.query(
-      'DELETE FROM tasks WHERE id = ? LIMIT 1',
-      [taskId]
-    );
+    const [result] = await conn.query('DELETE FROM tasks WHERE id = ? LIMIT 1', [taskId]);
 
     if (!result.affectedRows) {
       await conn.rollback();
@@ -811,7 +784,6 @@ api.delete('/tasks/:id', requireAdminOrRoot, async (req, res) => {
     }
 
     await conn.commit();
-    // Puedes devolver 204 (sin body) o 200 con un JSON
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error('Error borrando tarea:', err);
@@ -887,8 +859,7 @@ api.get('/my-tasks', requireAnyAuthenticated, async (req, res) => {
 
 // Alias opcional: GET /api/tasks/my  -> mismo que /api/my-tasks
 api.get('/tasks/my', requireAnyAuthenticated, async (req, res) => {
-  // Reutilizamos la lógica de arriba
-  req.url = '/my-tasks'; // truco sencillo
+  req.url = '/my-tasks'; // redirige internamente al handler de arriba
   return api.handle(req, res);
 });
 
@@ -897,7 +868,6 @@ api.get('/tasks/my', requireAnyAuthenticated, async (req, res) => {
 // ========================
 
 // GET /api/tasks/:id/attachments
-// Lista las evidencias de una tarea (sin devolver el binario)
 api.get('/tasks/:id/attachments', requireAnyAuthenticated, async (req, res) => {
   const taskId = Number(req.params.id);
   if (!taskId) {
@@ -920,7 +890,7 @@ api.get('/tasks/:id/attachments', requireAnyAuthenticated, async (req, res) => {
         WHERE task_id = ?
         ORDER BY created_at DESC
       `,
-      [taskId]
+      [taskId],
     );
 
     const list = Array.isArray(rows) ? rows : [];
@@ -953,7 +923,7 @@ api.post('/tasks/:id/attachments', requireAnyAuthenticated, async (req, res) => 
     // Convertir base64 -> Buffer
     const buffer = Buffer.from(
       base64Data.replace(/^data:[^;]+;base64,/, ''), // por si viene con prefijo data:
-      'base64'
+      'base64',
     );
 
     const sizeBytes = buffer.length;
@@ -965,7 +935,7 @@ api.post('/tasks/:id/attachments', requireAnyAuthenticated, async (req, res) => 
           (task_id, uploaded_by, file_data, file_name, mime_type, size_bytes, sha256)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `,
-      [taskId, userId, buffer, fileName, mimeType, sizeBytes, sha256]
+      [taskId, userId, buffer, fileName, mimeType, sizeBytes, sha256],
     );
 
     return res.status(201).json({
@@ -999,7 +969,7 @@ api.get('/attachments/:id/download', requireAnyAuthenticated, async (req, res) =
         WHERE id = ?
         LIMIT 1
       `,
-      [id]
+      [id],
     );
 
     const list = Array.isArray(rows) ? rows : [];
@@ -1010,10 +980,7 @@ api.get('/attachments/:id/download', requireAnyAuthenticated, async (req, res) =
     const att = list[0];
 
     res.setHeader('Content-Type', att.mime_type);
-    res.setHeader(
-      'Content-Disposition',
-      `inline; filename="${att.file_name}"`
-    );
+    res.setHeader('Content-Disposition', `inline; filename="${att.file_name}"`);
     return res.send(att.file_data);
   } catch (e) {
     console.error('Error descargando evidencia:', e);
@@ -1025,7 +992,7 @@ api.get('/attachments/:id/download', requireAnyAuthenticated, async (req, res) =
 api.get('/tasks/:taskId/attachments/:attId/file', async (req, res) => {
   try {
     const taskId = Number(req.params.taskId);
-    const attId  = Number(req.params.attId);
+    const attId = Number(req.params.attId);
 
     if (!taskId || !attId) {
       return res.status(400).json({ message: 'ids inválidos' });
@@ -1042,7 +1009,7 @@ api.get('/tasks/:taskId/attachments/:attId/file', async (req, res) => {
         WHERE id = ? AND task_id = ?
         LIMIT 1
       `,
-      [attId, taskId]
+      [attId, taskId],
     );
 
     const list = Array.isArray(rows) ? rows : [];
@@ -1055,7 +1022,7 @@ api.get('/tasks/:taskId/attachments/:attId/file', async (req, res) => {
     res.setHeader('Content-Type', att.mimeType || 'application/octet-stream');
     res.setHeader(
       'Content-Disposition',
-      `inline; filename="${String(att.fileName || 'archivo').replace(/"/g, '\\"')}"`
+      `inline; filename="${String(att.fileName || 'archivo').replace(/"/g, '\\"')}"`,
     );
 
     // Enviar binario
@@ -1066,490 +1033,197 @@ api.get('/tasks/:taskId/attachments/:attId/file', async (req, res) => {
   }
 });
 
-//* ========================
- //*  Dashboard (resumen tareas)
- //* ====================== */
+// DELETE /api/tasks/:taskId/attachments/:attId
+// - root/admin: pueden borrar cualquier evidencia por id
+// - usuario: solo puede borrar evidencias que él subió (uploaded_by = userId)
+api.delete(
+  '/tasks/:taskId/attachments/:attId',
+  requireAnyAuthenticated,
+  async (req, res) => {
+    try {
+      const taskId = Number(req.params.taskId);
+      const attId = Number(req.params.attId);
+      const userId = req.authUserId;
+      const role = req.authRole; // 'root' | 'admin' | 'usuario'
 
-// GET /api/dashboard/summary?year=2025&month=11
-// Si no mandas year/month, usa el mes actual.
-api.get('/dashboard/summary', requireAdminOrRoot, async (req, res) => {
-  try {
-    const now = new Date();
-    const year = Number(req.query.year) || now.getFullYear();
-    const month = Number(req.query.month) || (now.getMonth() + 1); // 1..12
+      if (!taskId || !attId) {
+        return res.status(400).json({ message: 'ids inválidos' });
+      }
 
-    const mm = String(month).padStart(2, '0');
+      console.log('DELETE attachment', { taskId, attId, userId, role });
 
-    // Rango del mes seleccionado [start, nextMonth)
-    const startDateStr = `${year}-${mm}-01`;
-    const nextMonth = month === 12 ? 1 : month + 1;
-    const nextYear = month === 12 ? year + 1 : year;
-    const nextMm = String(nextMonth).padStart(2, '0');
-    const endDateStr = `${nextYear}-${nextMm}-01`;
-
-    // 1) Conteo por estado (para tasks con due_date en ese mes)
-    const [statusRows] = await pool.query(
-      `
-        SELECT t.current_status_id AS status_id, COUNT(*) AS count
-        FROM tasks t
-        WHERE t.archived = 0
-          AND t.due_date IS NOT NULL
-          AND t.due_date >= ?
-          AND t.due_date < ?
-        GROUP BY t.current_status_id
-      `,
-      [startDateStr, endDateStr]
-    );
-
-    let total = 0;
-    let pending = 0;
-    let inProgress = 0;
-    let done = 0;
-
-    const statusList = Array.isArray(statusRows) ? statusRows : [];
-    for (const r of statusList) {
-      const c = Number(r.count) || 0;
-      total += c;
-
-      const code = STATUS_CODES[r.status_id] || 'pending';
-      if (code === 'pending') pending = c;
-      else if (code === 'in_progress') inProgress = c;
-      else if (code === 'done') done = c;
-    }
-
-    // 2) Conteo por prioridad (mismo rango)
-    const [priorityRows] = await pool.query(
-      `
-        SELECT t.priority_id AS priority_id, COUNT(*) AS count
-        FROM tasks t
-        WHERE t.archived = 0
-          AND t.due_date IS NOT NULL
-          AND t.due_date >= ?
-          AND t.due_date < ?
-        GROUP BY t.priority_id
-      `,
-      [startDateStr, endDateStr]
-    );
-
-    let low = 0;
-    let medium = 0;
-    let high = 0;
-
-    const prioList = Array.isArray(priorityRows) ? priorityRows : [];
-    for (const r of prioList) {
-      const c = Number(r.count) || 0;
-      const code = PRIORITY_CODES[r.priority_id] || 'medium';
-      if (code === 'low') low = c;
-      else if (code === 'medium') medium = c;
-      else if (code === 'high') high = c;
-    }
-
-    // 3) Tareas que vencen en las próximas 48 horas (pendientes / en proceso)
-    const [dueSoonRows] = await pool.query(
-      `
-        SELECT COUNT(*) AS c
-        FROM tasks t
-        WHERE t.archived = 0
-          AND t.due_date IS NOT NULL
-          AND t.due_date >= CURDATE()
-          AND t.due_date <= DATE_ADD(NOW(), INTERVAL 2 DAY)
-          AND t.current_status_id IN (?, ?)
-      `,
-      [STATUS_IDS.pending, STATUS_IDS.in_progress]
-    );
-    const dueSoon48h =
-      Array.isArray(dueSoonRows) && dueSoonRows.length
-        ? Number(dueSoonRows[0].c) || 0
-        : 0;
-
-    return res.json({
-      period: { year, month },
-      totals: {
-        total,
-        pending,
-        inProgress,
-        done,
-      },
-      priorities: {
-        low,
-        medium,
-        high,
-      },
-      dueSoon48h,
-    });
-  } catch (err) {
-    console.error('Error en /dashboard/summary:', err);
-    return res
-      .status(500)
-      .json({ message: 'Error al obtener resumen de dashboard' });
-  }
-});
-
-/* ========================
- *  Dashboard (resumen tareas)
- * ====================== */
-
-// GET /api/dashboard/summary?year=2025&month=11
-// Si no mandas year/month, usa el mes actual.
-api.get('/dashboard/summary', requireAdminOrRoot, async (req, res) => {
-  try {
-    const now = new Date();
-    const year = Number(req.query.year) || now.getFullYear();
-    const month = Number(req.query.month) || (now.getMonth() + 1); // 1..12
-
-    const mm = String(month).padStart(2, '0');
-
-    // Rango del mes seleccionado [start, nextMonth)
-    const startDateStr = `${year}-${mm}-01`;
-    const nextMonth = month === 12 ? 1 : month + 1;
-    const nextYear = month === 12 ? year + 1 : year;
-    const nextMm = String(nextMonth).padStart(2, '0');
-    const endDateStr = `${nextYear}-${nextMm}-01`;
-
-    // 1) Conteo por estado (para tasks con due_date en ese mes)
-    const [statusRows] = await pool.query(
-      `
-        SELECT t.current_status_id AS status_id, COUNT(*) AS count
-        FROM tasks t
-        WHERE t.archived = 0
-          AND t.due_date IS NOT NULL
-          AND t.due_date >= ?
-          AND t.due_date < ?
-        GROUP BY t.current_status_id
-      `,
-      [startDateStr, endDateStr]
-    );
-
-    let total = 0;
-    let pending = 0;
-    let inProgress = 0;
-    let done = 0;
-
-    const statusList = Array.isArray(statusRows) ? statusRows : [];
-    for (const r of statusList) {
-      const c = Number(r.count) || 0;
-      total += c;
-
-      const code = STATUS_CODES[r.status_id] || 'pending';
-      if (code === 'pending') pending = c;
-      else if (code === 'in_progress') inProgress = c;
-      else if (code === 'done') done = c;
-    }
-
-    // 2) Conteo por prioridad (mismo rango)
-    const [priorityRows] = await pool.query(
-      `
-        SELECT t.priority_id AS priority_id, COUNT(*) AS count
-        FROM tasks t
-        WHERE t.archived = 0
-          AND t.due_date IS NOT NULL
-          AND t.due_date >= ?
-          AND t.due_date < ?
-        GROUP BY t.priority_id
-      `,
-      [startDateStr, endDateStr]
-    );
-
-    let low = 0;
-    let medium = 0;
-    let high = 0;
-
-    const prioList = Array.isArray(priorityRows) ? priorityRows : [];
-    for (const r of prioList) {
-      const c = Number(r.count) || 0;
-      const code = PRIORITY_CODES[r.priority_id] || 'medium';
-      if (code === 'low') low = c;
-      else if (code === 'medium') medium = c;
-      else if (code === 'high') high = c;
-    }
-
-    // 3) Tareas que vencen en las próximas 48 horas (pendientes / en proceso)
-    const [dueSoonRows] = await pool.query(
-      `
-        SELECT COUNT(*) AS c
-        FROM tasks t
-        WHERE t.archived = 0
-          AND t.due_date IS NOT NULL
-          AND t.due_date >= CURDATE()
-          AND t.due_date <= DATE_ADD(NOW(), INTERVAL 2 DAY)
-          AND t.current_status_id IN (?, ?)
-      `,
-      [STATUS_IDS.pending, STATUS_IDS.in_progress]
-    );
-    const dueSoon48h =
-      Array.isArray(dueSoonRows) && dueSoonRows.length
-        ? Number(dueSoonRows[0].c) || 0
-        : 0;
-
-    return res.json({
-      period: { year, month },
-      totals: {
-        total,
-        pending,
-        inProgress,
-        done,
-      },
-      priorities: {
-        low,
-        medium,
-        high,
-      },
-      dueSoon48h,
-    });
-  } catch (err) {
-    console.error('Error en /dashboard/summary:', err);
-    return res
-      .status(500)
-      .json({ message: 'Error al obtener resumen de dashboard' });
-  }
-});
-
-/* ========================
- *  Dashboard (resumen tareas)
- * ====================== */
-
-// GET /api/dashboard/summary?year=2025&month=11
-// Si no mandas year/month, usa el mes actual.
-api.get('/dashboard/summary', requireAdminOrRoot, async (req, res) => {
-  try {
-    const now = new Date();
-    const year = Number(req.query.year) || now.getFullYear();
-    const month = Number(req.query.month) || (now.getMonth() + 1); // 1..12
-
-    const mm = String(month).padStart(2, '0');
-
-    // Rango del mes seleccionado [start, nextMonth)
-    const startDateStr = `${year}-${mm}-01`;
-    const nextMonth = month === 12 ? 1 : month + 1;
-    const nextYear = month === 12 ? year + 1 : year;
-    const nextMm = String(nextMonth).padStart(2, '0');
-    const endDateStr = `${nextYear}-${nextMm}-01`;
-
-    // 1) Conteo por estado (para tasks con due_date en ese mes)
-    const [statusRows] = await pool.query(
-      `
-        SELECT t.current_status_id AS status_id, COUNT(*) AS count
-        FROM tasks t
-        WHERE t.archived = 0
-          AND t.due_date IS NOT NULL
-          AND t.due_date >= ?
-          AND t.due_date < ?
-        GROUP BY t.current_status_id
-      `,
-      [startDateStr, endDateStr]
-    );
-
-    let total = 0;
-    let pending = 0;
-    let inProgress = 0;
-    let done = 0;
-
-    const statusList = Array.isArray(statusRows) ? statusRows : [];
-    for (const r of statusList) {
-      const c = Number(r.count) || 0;
-      total += c;
-
-      const code = STATUS_CODES[r.status_id] || 'pending';
-      if (code === 'pending') pending = c;
-      else if (code === 'in_progress') inProgress = c;
-      else if (code === 'done') done = c;
-    }
-
-    // 2) Conteo por prioridad (mismo rango)
-    const [priorityRows] = await pool.query(
-      `
-        SELECT t.priority_id AS priority_id, COUNT(*) AS count
-        FROM tasks t
-        WHERE t.archived = 0
-          AND t.due_date IS NOT NULL
-          AND t.due_date >= ?
-          AND t.due_date < ?
-        GROUP BY t.priority_id
-      `,
-      [startDateStr, endDateStr]
-    );
-
-    let low = 0;
-    let medium = 0;
-    let high = 0;
-
-    const prioList = Array.isArray(priorityRows) ? priorityRows : [];
-    for (const r of prioList) {
-      const c = Number(r.count) || 0;
-      const code = PRIORITY_CODES[r.priority_id] || 'medium';
-      if (code === 'low') low = c;
-      else if (code === 'medium') medium = c;
-      else if (code === 'high') high = c;
-    }
-
-    // 3) Tareas que vencen en las próximas 48 horas (pendientes / en proceso)
-    const [dueSoonRows] = await pool.query(
-      `
-        SELECT COUNT(*) AS c
-        FROM tasks t
-        WHERE t.archived = 0
-          AND t.due_date IS NOT NULL
-          AND t.due_date >= CURDATE()
-          AND t.due_date <= DATE_ADD(NOW(), INTERVAL 2 DAY)
-          AND t.current_status_id IN (?, ?)
-      `,
-      [STATUS_IDS.pending, STATUS_IDS.in_progress]
-    );
-    const dueSoon48h =
-      Array.isArray(dueSoonRows) && dueSoonRows.length
-        ? Number(dueSoonRows[0].c) || 0
-        : 0;
-
-    return res.json({
-      period: { year, month },
-      totals: {
-        total,
-        pending,
-        inProgress,
-        done,
-      },
-      priorities: {
-        low,
-        medium,
-        high,
-      },
-      dueSoon48h,
-    });
-  } catch (err) {
-    console.error('Error en /dashboard/summary:', err);
-    return res
-      .status(500)
-      .json({ message: 'Error al obtener resumen de dashboard' });
-  }
-});
-
-
-/* ========================
- *  Perfil del usuario actual
- * ====================== */
-
-// GET /api/me  -> datos del usuario logueado
-api.get('/me', requireAnyAuthenticated, async (req, res) => {
-  try {
-    const userId = req.authUserId;
-
-    const sql = `
-      SELECT
-        u.id,
-        u.name,
-        u.email,
-        u.phone,
-        u.about,
-        u.avatar_url,
-        u.is_active,
-        r.name AS role
-      FROM users u
-      JOIN roles r ON r.id = u.role_id
-      WHERE u.id = ?
-      LIMIT 1
-    `;
-
-    const [rows] = await pool.execute(sql, [userId]);
-    const list = Array.isArray(rows) ? rows : [];
-
-    if (!list.length) {
-      return res.status(404).json({ message: 'Usuario no encontrado' });
-    }
-
-    const u = list[0];
-
-    return res.json({
-      user: {
-        id: u.id,
-        name: u.name,
-        email: u.email,
-        role: (u.role || '').toLowerCase(), // 'root' | 'admin' | 'usuario'
-        phone: u.phone,
-        about: u.about,
-        avatar_url: u.avatar_url,
-        is_active: !!u.is_active,
-      },
-    });
-  } catch (err) {
-    console.error('Error en GET /me:', err);
-    return res.status(500).json({ message: 'Error al obtener perfil' });
-  }
-});
-
-// PUT /api/me  -> actualizar perfil básico (nombre, teléfono, about, avatar_url)
-api.put('/me', requireAnyAuthenticated, async (req, res) => {
-  try {
-    const userId = req.authUserId;
-    const { name, phone, about, avatar_url } = req.body ?? {};
-
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ message: 'name es requerido' });
-    }
-
-    await pool.execute(
-      `
-        UPDATE users
-        SET name = ?, phone = ?, about = ?, avatar_url = ?
-        WHERE id = ?
-      `,
-      [name, phone || null, about || null, avatar_url || null, userId]
-    );
-
-    // devolvemos el perfil actualizado
-    const [rows] = await pool.execute(
-      `
-        SELECT
-          u.id,
-          u.name,
-          u.email,
-          u.phone,
-          u.about,
-          u.avatar_url,
-          u.is_active,
-          r.name AS role
-        FROM users u
-        JOIN roles r ON r.id = u.role_id
-        WHERE u.id = ?
+      // 1) Verificar que el adjunto exista
+      const [rows] = await pool.query(
+        `
+        SELECT uploaded_by
+        FROM task_attachments
+        WHERE id = ? AND task_id = ?
         LIMIT 1
       `,
-      [userId]
+        [attId, taskId],
+      );
+
+      const list = Array.isArray(rows) ? rows : [];
+      if (!list.length) {
+        // No existe el archivo
+        return res.status(404).json({ message: 'Archivo no encontrado' });
+      }
+
+      const ownerId = list[0].uploaded_by;
+
+      // 2) Solo root/admin o el dueño pueden borrar
+      if (role === 'usuario' && ownerId !== userId) {
+        // El archivo existe, pero no le pertenece a este usuario
+        return res.status(403).json({
+          message: 'No puedes eliminar esta evidencia (fue subida por otro usuario).',
+        });
+      }
+
+      // 3) Borrar el adjunto
+      const [result] = await pool.query(
+        `
+        DELETE FROM task_attachments
+        WHERE id = ? AND task_id = ?
+      `,
+        [attId, taskId],
+      );
+
+      console.log('DELETE attachment result:', result);
+
+      return res.status(204).end();
+    } catch (err) {
+      console.error('Error borrando evidencia:', err);
+      return res.status(500).json({ message: 'Error al eliminar evidencia' });
+    }
+  },
+);
+
+/* ========================
+ *  Dashboard (resumen tareas)
+ * ====================== */
+
+// GET /api/dashboard/summary?year=2025&month=11
+// Si no mandas year/month, usa el mes actual.
+api.get('/dashboard/summary', requireAdminOrRoot, async (req, res) => {
+  try {
+    const now = new Date();
+    const year = Number(req.query.year) || now.getFullYear();
+    const month = Number(req.query.month) || now.getMonth() + 1; // 1..12
+
+    const mm = String(month).padStart(2, '0');
+
+    // Rango del mes seleccionado [start, nextMonth)
+    const startDateStr = `${year}-${mm}-01`;
+    const nextMonth = month === 12 ? 1 : month + 1;
+    const nextYear = month === 12 ? year + 1 : year;
+    const nextMm = String(nextMonth).padStart(2, '0');
+    const endDateStr = `${nextYear}-${nextMm}-01`;
+
+    // 1) Conteo por estado (para tasks con due_date en ese mes)
+    const [statusRows] = await pool.query(
+      `
+        SELECT t.current_status_id AS status_id, COUNT(*) AS count
+        FROM tasks t
+        WHERE t.archived = 0
+          AND t.due_date IS NOT NULL
+          AND t.due_date >= ?
+          AND t.due_date < ?
+        GROUP BY t.current_status_id
+      `,
+      [startDateStr, endDateStr],
     );
 
-    const list = Array.isArray(rows) ? rows : [];
-    if (!list.length) {
-      return res.status(404).json({ message: 'Usuario no encontrado' });
+    let total = 0;
+    let pending = 0;
+    let inProgress = 0;
+    let done = 0;
+
+    const statusList = Array.isArray(statusRows) ? statusRows : [];
+    for (const r of statusList) {
+      const c = Number(r.count) || 0;
+      total += c;
+
+      const code = STATUS_CODES[r.status_id] || 'pending';
+      if (code === 'pending') pending = c;
+      else if (code === 'in_progress') inProgress = c;
+      else if (code === 'done') done = c;
     }
 
-    const u = list[0];
+    // 2) Conteo por prioridad (mismo rango)
+    const [priorityRows] = await pool.query(
+      `
+        SELECT t.priority_id AS priority_id, COUNT(*) AS count
+        FROM tasks t
+        WHERE t.archived = 0
+          AND t.due_date IS NOT NULL
+          AND t.due_date >= ?
+          AND t.due_date < ?
+        GROUP BY t.priority_id
+      `,
+      [startDateStr, endDateStr],
+    );
+
+    let low = 0;
+    let medium = 0;
+    let high = 0;
+
+    const prioList = Array.isArray(priorityRows) ? priorityRows : [];
+    for (const r of prioList) {
+      const c = Number(r.count) || 0;
+      const code = PRIORITY_CODES[r.priority_id] || 'medium';
+      if (code === 'low') low = c;
+      else if (code === 'medium') medium = c;
+      else if (code === 'high') high = c;
+    }
+
+    // 3) Tareas que vencen en las próximas 48 horas (pendientes / en proceso)
+    const [dueSoonRows] = await pool.query(
+      `
+        SELECT COUNT(*) AS c
+        FROM tasks t
+        WHERE t.archived = 0
+          AND t.due_date IS NOT NULL
+          AND t.due_date >= CURDATE()
+          AND t.due_date <= DATE_ADD(NOW(), INTERVAL 2 DAY)
+          AND t.current_status_id IN (?, ?)
+      `,
+      [STATUS_IDS.pending, STATUS_IDS.in_progress],
+    );
+    const dueSoon48h =
+      Array.isArray(dueSoonRows) && dueSoonRows.length ? Number(dueSoonRows[0].c) || 0 : 0;
 
     return res.json({
-      user: {
-        id: u.id,
-        name: u.name,
-        email: u.email,
-        role: (u.role || '').toLowerCase(),
-        phone: u.phone,
-        about: u.about,
-        avatar_url: u.avatar_url,
-        is_active: !!u.is_active,
+      period: { year, month },
+      totals: {
+        total,
+        pending,
+        inProgress,
+        done,
       },
+      priorities: {
+        low,
+        medium,
+        high,
+      },
+      dueSoon48h,
     });
   } catch (err) {
-    console.error('Error en PUT /me:', err);
-    return res.status(500).json({ message: 'Error al actualizar perfil' });
+    console.error('Error en /dashboard/summary:', err);
+    return res
+      .status(500)
+      .json({ message: 'Error al obtener resumen de dashboard' });
   }
 });
 
-// ========================
-//  Comentarios de tareas
-// ========================
+/* ========================
+ *  Comentarios de tareas
+ * ====================== */
 
 // GET /api/tasks/:id/comments
-// Lista los comentarios de una tarea en orden cronológico
 api.get('/tasks/:id/comments', requireAnyAuthenticated, async (req, res) => {
   try {
     const taskId = Number(req.params.id);
-    const userId = req.authUserId;          // viene del middleware
+    const userId = req.authUserId;
     if (!taskId) {
       return res.status(400).json({ message: 'taskId inválido' });
     }
@@ -1572,7 +1246,7 @@ api.get('/tasks/:id/comments', requireAnyAuthenticated, async (req, res) => {
         WHERE c.task_id = ?
         ORDER BY c.created_at ASC
       `,
-      [userId, taskId]
+      [userId, taskId],
     );
 
     const list = Array.isArray(rows) ? rows : [];
@@ -1584,7 +1258,6 @@ api.get('/tasks/:id/comments', requireAnyAuthenticated, async (req, res) => {
 });
 
 // POST /api/tasks/:id/comments
-// Crear un comentario nuevo en la tarea
 // Body JSON: { "body": "texto del comentario" }
 api.post('/tasks/:id/comments', requireAnyAuthenticated, async (req, res) => {
   try {
@@ -1603,7 +1276,7 @@ api.post('/tasks/:id/comments', requireAnyAuthenticated, async (req, res) => {
     // Verificar que la tarea exista y no esté archivada
     const [taskRows] = await pool.query(
       'SELECT id FROM tasks WHERE id = ? AND archived = 0 LIMIT 1',
-      [taskId]
+      [taskId],
     );
     if (!Array.isArray(taskRows) || taskRows.length === 0) {
       return res.status(404).json({ message: 'Tarea no encontrada' });
@@ -1614,11 +1287,11 @@ api.post('/tasks/:id/comments', requireAnyAuthenticated, async (req, res) => {
         INSERT INTO task_comments (task_id, user_id, body)
         VALUES (?, ?, ?)
       `,
-      [taskId, userId, text]
+      [taskId, userId, text],
     );
     const commentId = insertResult.insertId;
 
-    // Devolvemos el comentario completo (con autor, rol, isAdmin, isMine)
+    // Devolvemos el comentario completo
     const [rows] = await pool.query(
       `
         SELECT
@@ -1637,12 +1310,14 @@ api.post('/tasks/:id/comments', requireAnyAuthenticated, async (req, res) => {
         WHERE c.id = ?
         LIMIT 1
       `,
-      [userId, commentId]
+      [userId, commentId],
     );
 
     const list = Array.isArray(rows) ? rows : [];
     if (!list.length) {
-      return res.status(500).json({ message: 'No se pudo recuperar el comentario creado' });
+      return res
+        .status(500)
+        .json({ message: 'No se pudo recuperar el comentario creado' });
     }
 
     return res.status(201).json(list[0]);
@@ -1653,7 +1328,6 @@ api.post('/tasks/:id/comments', requireAnyAuthenticated, async (req, res) => {
 });
 
 // DELETE /api/task-comments/:id
-// Opcional: borrar comentario (root/admin o dueño)
 api.delete('/task-comments/:id', requireAnyAuthenticated, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -1664,10 +1338,9 @@ api.delete('/task-comments/:id', requireAnyAuthenticated, async (req, res) => {
       return res.status(400).json({ message: 'id inválido' });
     }
 
-    const [rows] = await pool.query(
-      'SELECT user_id FROM task_comments WHERE id = ? LIMIT 1',
-      [id]
-    );
+    const [rows] = await pool.query('SELECT user_id FROM task_comments WHERE id = ? LIMIT 1', [
+      id,
+    ]);
     const list = Array.isArray(rows) ? rows : [];
     if (!list.length) {
       return res.status(404).json({ message: 'Comentario no encontrado' });
@@ -1694,20 +1367,8 @@ api.delete('/task-comments/:id', requireAnyAuthenticated, async (req, res) => {
 
 // Crear foro
 // POST /api/forums
-// Body JSON:
-// {
-//   "title": "Sprint 10 - Entregables",
-//   "description": "Hilo para dudas",
-//   "isPublic": true/false,
-//   "memberEmails": ["alumno1@escuela.com", "alumno2@escuela.com"]
-// }
 api.post('/forums', requireAdminOrRoot, async (req, res) => {
-  const {
-    title,
-    description = null,
-    isPublic = true,
-    memberEmails = []
-  } = req.body ?? {};
+  const { title, description = null, isPublic = true, memberEmails = [] } = req.body ?? {};
 
   if (!title) {
     return res.status(400).json({ message: 'title es requerido' });
@@ -1730,7 +1391,7 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
         INSERT INTO forums (title, description, is_public, created_by)
         VALUES (?, ?, ?, ?)
       `,
-      [title, description, isPublic ? 1 : 0, createdBy]
+      [title, description, isPublic ? 1 : 0, createdBy],
     );
 
     const forumId = forumResult.insertId;
@@ -1744,7 +1405,7 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
           FROM users
           WHERE email IN (${memberEmails.map(() => '?').join(',')})
         `,
-        memberEmails
+        memberEmails,
       );
 
       const userList = Array.isArray(userRows) ? userRows : [];
@@ -1756,7 +1417,7 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
             INSERT INTO forum_members (forum_id, user_id)
             VALUES ?
           `,
-          [values]
+          [values],
         );
 
         members = userList.map((u) => u.email);
@@ -1782,7 +1443,7 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
   }
 });
 
-// Listar foros
+// Listar foros (admin/root)
 // GET /api/forums
 api.get('/forums', requireAdminOrRoot, async (_req, res) => {
   try {
@@ -1813,7 +1474,7 @@ api.get('/forums', requireAdminOrRoot, async (_req, res) => {
 // GET /api/forums/my
 api.get('/forums/my', requireAnyAuthenticated, async (req, res) => {
   try {
-    const userId = req.authUserId; // viene de requireAnyAuthenticated
+    const userId = req.authUserId;
 
     const sql = `
       SELECT
@@ -1903,7 +1564,6 @@ api.get('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
           fileName: r.attFileName,
           mimeType: r.attMimeType,
           sizeBytes: r.attSizeBytes,
-          // la app usará Env.apiBaseUrl + downloadUrl
           downloadUrl: `/api/forums/attachments/${r.attId}/file`,
         });
       }
@@ -1921,13 +1581,8 @@ api.get('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
 // Body JSON: { text?, fileName, mimeType, base64Data }
 api.post('/forums/:id/posts-with-file', requireAnyAuthenticated, async (req, res) => {
   const forumId = Number(req.params.id);
-  const userId  = req.authUserId;
-  const {
-    text = '',
-    fileName,
-    mimeType,
-    base64Data,
-  } = req.body ?? {};
+  const userId = req.authUserId;
+  const { text = '', fileName, mimeType, base64Data } = req.body ?? {};
 
   if (!forumId) {
     return res.status(400).json({ message: 'forumId inválido' });
@@ -1940,10 +1595,7 @@ api.post('/forums/:id/posts-with-file', requireAnyAuthenticated, async (req, res
 
   try {
     // Verificar que el foro exista
-    const [forumRows] = await pool.query(
-      'SELECT id FROM forums WHERE id = ? LIMIT 1',
-      [forumId]
-    );
+    const [forumRows] = await pool.query('SELECT id FROM forums WHERE id = ? LIMIT 1', [forumId]);
     if (!Array.isArray(forumRows) || forumRows.length === 0) {
       return res.status(404).json({ message: 'Foro no encontrado' });
     }
@@ -1953,7 +1605,7 @@ api.post('/forums/:id/posts-with-file', requireAnyAuthenticated, async (req, res
     // Decodificar base64
     const buffer = Buffer.from(
       base64Data.replace(/^data:[^;]+;base64,/, ''),
-      'base64'
+      'base64',
     );
     const sizeBytes = buffer.length;
     const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
@@ -1968,7 +1620,7 @@ api.post('/forums/:id/posts-with-file', requireAnyAuthenticated, async (req, res
           INSERT INTO forum_posts (forum_id, user_id, body)
           VALUES (?, ?, ?)
         `,
-        [forumId, userId, body]
+        [forumId, userId, body],
       );
       const postId = postResult.insertId;
 
@@ -1979,7 +1631,7 @@ api.post('/forums/:id/posts-with-file', requireAnyAuthenticated, async (req, res
             (forum_post_id, uploaded_by, file_data, file_name, mime_type, size_bytes, sha256)
           VALUES (?, ?, ?, ?, ?, ?, ?)
         `,
-        [postId, userId, buffer, fileName, mimeType, sizeBytes, sha256]
+        [postId, userId, buffer, fileName, mimeType, sizeBytes, sha256],
       );
       const attId = attResult.insertId;
 
@@ -1992,7 +1644,7 @@ api.post('/forums/:id/posts-with-file', requireAnyAuthenticated, async (req, res
           WHERE u.id = ?
           LIMIT 1
         `,
-        [userId]
+        [userId],
       );
       const uList = Array.isArray(uRows) ? uRows : [];
       const authorName = uList.length ? uList[0].name : 'Usuario';
@@ -2052,7 +1704,7 @@ api.get('/forums/attachments/:id/file', async (req, res) => {
         WHERE id = ?
         LIMIT 1
       `,
-      [id]
+      [id],
     );
 
     const list = Array.isArray(rows) ? rows : [];
@@ -2065,7 +1717,7 @@ api.get('/forums/attachments/:id/file', async (req, res) => {
     res.setHeader('Content-Type', att.mimeType || 'application/octet-stream');
     res.setHeader(
       'Content-Disposition',
-      `inline; filename="${String(att.fileName || 'archivo').replace(/"/g, '\\"')}"`
+      `inline; filename="${String(att.fileName || 'archivo').replace(/"/g, '\\"')}"`,
     );
     return res.end(att.fileData);
   } catch (err) {
@@ -2074,7 +1726,7 @@ api.get('/forums/attachments/:id/file', async (req, res) => {
   }
 });
 
-// Crear mensaje en un foro
+// Crear mensaje en un foro (texto)
 // POST /api/forums/:id/posts
 // Body JSON: { "text": "Mensaje..." }
 api.post('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
@@ -2091,10 +1743,7 @@ api.post('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
     }
 
     // Verificamos que el foro exista
-    const [forumRows] = await pool.query(
-      'SELECT id FROM forums WHERE id = ? LIMIT 1',
-      [forumId]
-    );
+    const [forumRows] = await pool.query('SELECT id FROM forums WHERE id = ? LIMIT 1', [forumId]);
     if (!Array.isArray(forumRows) || forumRows.length === 0) {
       return res.status(404).json({ message: 'Foro no encontrado' });
     }
@@ -2107,34 +1756,36 @@ api.post('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
         INSERT INTO forum_posts (forum_id, user_id, body)
         VALUES (?, ?, ?)
       `,
-      [forumId, userId, body]
+      [forumId, userId, body],
     );
 
     const postId = insertResult.insertId;
 
-    // Recuperamos el mensaje con isMine + isAdmin
-        const [rows] = await pool.query(
-          `
-            SELECT
-              fp.id,
-              u.id AS authorId,          -- 🔹 NUEVO
-              u.name AS author,
-              r.name AS role,            -- 🔹 NUEVO
-              fp.body AS text,
-              fp.created_at AS createdAt,
-              CASE WHEN r.name IN ('admin', 'root') THEN 1 ELSE 0 END AS isAdmin
-            FROM forum_posts fp
-            JOIN users u ON u.id = fp.user_id
-            JOIN roles r ON r.id = u.role_id
-            WHERE fp.id = ?
-            LIMIT 1
-          `,
-          [postId]
-        );
+    // Recuperamos el mensaje
+    const [rows] = await pool.query(
+      `
+        SELECT
+          fp.id,
+          u.id AS authorId,
+          u.name AS author,
+          r.name AS role,
+          fp.body AS text,
+          fp.created_at AS createdAt,
+          CASE WHEN r.name IN ('admin', 'root') THEN 1 ELSE 0 END AS isAdmin
+        FROM forum_posts fp
+        JOIN users u ON u.id = fp.user_id
+        JOIN roles r ON r.id = u.role_id
+        WHERE fp.id = ?
+        LIMIT 1
+      `,
+      [postId],
+    );
 
     const list = Array.isArray(rows) ? rows : [];
     if (!list.length) {
-      return res.status(500).json({ message: 'No se pudo recuperar el mensaje creado' });
+      return res
+        .status(500)
+        .json({ message: 'No se pudo recuperar el mensaje creado' });
     }
 
     return res.status(201).json(list[0]);
@@ -2157,13 +1808,7 @@ api.delete('/forums/:id', async (req, res) => {
         .json({ message: 'Solo el usuario root puede eliminar foros.' });
     }
 
-    // Si en tu esquema tienes ON DELETE CASCADE en posts/attachments,
-    // basta con borrar el foro. Si NO tienes cascade, borra primero posts/attachments.
-    // Ejemplo con CASCADE activado:
-    const [result] = await pool.execute(
-      'DELETE FROM forums WHERE id = ? LIMIT 1',
-      [forumId],
-    );
+    const [result] = await pool.execute('DELETE FROM forums WHERE id = ? LIMIT 1', [forumId]);
 
     if (result.affectedRows === 0) {
       return res.status(404).json({ message: 'Foro no encontrado' });
@@ -2176,75 +1821,10 @@ api.delete('/forums/:id', async (req, res) => {
   }
 });
 
-// DELETE /api/tasks/:taskId/attachments/:attId
-// - root/admin: pueden borrar cualquier evidencia por id
-// - usuario: solo puede borrar evidencias que él subió (uploaded_by = userId)
-// DELETE /api/tasks/:taskId/attachments/:attId
-api.delete('/tasks/:taskId/attachments/:attId', requireAnyAuthenticated, async (req, res) => {
-  try {
-    const taskId = Number(req.params.taskId);
-    const attId  = Number(req.params.attId);
-    const userId = req.authUserId;
-    const role   = req.authRole; // 'root' | 'admin' | 'usuario'
-
-    if (!taskId || !attId) {
-      return res.status(400).json({ message: 'ids inválidos' });
-    }
-
-    console.log('DELETE attachment', { taskId, attId, userId, role });
-
-    // 1) Verificar que el adjunto exista
-    const [rows] = await pool.query(
-      `
-        SELECT uploaded_by
-        FROM task_attachments
-        WHERE id = ? AND task_id = ?
-        LIMIT 1
-      `,
-      [attId, taskId]
-    );
-
-    const list = Array.isArray(rows) ? rows : [];
-    if (!list.length) {
-      // No existe el archivo
-      return res.status(404).json({ message: 'Archivo no encontrado' });
-    }
-
-    const ownerId = list[0].uploaded_by;
-
-    // 2) Solo root/admin o el dueño pueden borrar
-    if (role === 'usuario' && ownerId !== userId) {
-      // El archivo existe, pero no le pertenece a este usuario
-      return res.status(403).json({
-        message: 'No puedes eliminar esta evidencia (fue subida por otro usuario).',
-      });
-    }
-
-    // 3) Borrar el adjunto
-    const [result] = await pool.query(
-      `
-        DELETE FROM task_attachments
-        WHERE id = ? AND task_id = ?
-      `,
-      [attId, taskId]
-    );
-
-    console.log('DELETE attachment result:', result);
-
-    // Aunque por lógica debería ser 1 fila,
-    // si fuera 0 aquí, es un caso raro, pero no pasa nada grave.
-    return res.status(204).end();
-  } catch (err) {
-    console.error('Error borrando evidencia:', err);
-    return res.status(500).json({ message: 'Error al eliminar evidencia' });
-  }
-});
-
-
-
 /* ========================
  *  Montaje y 404 JSON
  * ====================== */
+
 app.use('/api', api);
 app.use((_req, res) => res.status(404).json({ message: 'Not found' }));
 
