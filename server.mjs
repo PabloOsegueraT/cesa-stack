@@ -283,8 +283,11 @@ api.put('/users/:id/password', requireRoot, async (req, res) => {
  *  Perfil del usuario autenticado
  *  (Root, Admin o Usuario)
  * ====================== */
+/* ========================
+ *  Perfil del usuario actual (root / admin / usuario)
+ * ====================== */
 
-// Obtener mis datos
+// GET /api/me  -> datos del usuario logueado
 api.get('/me', requireAnyAuthenticated, async (req, res) => {
   try {
     const userId = req.authUserId;
@@ -297,6 +300,8 @@ api.get('/me', requireAnyAuthenticated, async (req, res) => {
           u.email,
           u.phone,
           u.about,
+          u.avatar_url,
+          u.is_active,
           r.name AS role
         FROM users u
         JOIN roles r ON r.id = u.role_id
@@ -312,51 +317,51 @@ api.get('/me', requireAnyAuthenticated, async (req, res) => {
     }
 
     const u = list[0];
+
     return res.json({
       user: {
         id: u.id,
         name: u.name,
         email: u.email,
+        role: (u.role || '').toLowerCase(), // 'root' | 'admin' | 'usuario'
         phone: u.phone,
         about: u.about,
-        role: u.role, // 'root' | 'admin' | 'usuario' según tengas en roles
+        avatar_url: u.avatar_url,
+        is_active: !!u.is_active,
       },
     });
-  } catch (e) {
-    console.error('Error en GET /me:', e);
-    return res.status(500).json({ message: 'Error interno' });
+  } catch (err) {
+    console.error('Error en GET /me:', err);
+    return res.status(500).json({ message: 'Error al obtener perfil' });
   }
 });
 
-// Actualizar MIS datos (no los de todos)
+// PUT /api/me  -> actualizar perfil básico (nombre, teléfono, about, avatar_url)
 api.put('/me', requireAnyAuthenticated, async (req, res) => {
   try {
     const userId = req.authUserId;
-    const { name, phone, about } = req.body ?? {};
+    const { name, phone, about, avatar_url } = req.body ?? {};
 
     if (!name || !String(name).trim()) {
       return res.status(400).json({ message: 'name es requerido' });
     }
 
-    // 👇 MUY IMPORTANTE: WHERE id = ?
     await pool.execute(
       `
         UPDATE users
-        SET
-          name  = ?,
-          phone = ?,
-          about = ?
+        SET name = ?, phone = ?, about = ?, avatar_url = ?
         WHERE id = ?
       `,
       [
         String(name).trim(),
-        phone ?? null,
-        about ?? null,
+        phone || null,
+        about || null,
+        avatar_url || null,
         userId,
       ]
     );
 
-    // Devolvemos el usuario actualizado
+    // devolvemos el perfil actualizado
     const [rows] = await pool.execute(
       `
         SELECT
@@ -365,6 +370,8 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
           u.email,
           u.phone,
           u.about,
+          u.avatar_url,
+          u.is_active,
           r.name AS role
         FROM users u
         JOIN roles r ON r.id = u.role_id
@@ -376,23 +383,26 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
 
     const list = Array.isArray(rows) ? rows : [];
     if (!list.length) {
-      return res.status(404).json({ message: 'Usuario no encontrado luego de actualizar' });
+      return res.status(404).json({ message: 'Usuario no encontrado' });
     }
 
     const u = list[0];
+
     return res.json({
       user: {
         id: u.id,
         name: u.name,
         email: u.email,
+        role: (u.role || '').toLowerCase(),
         phone: u.phone,
         about: u.about,
-        role: u.role,
+        avatar_url: u.avatar_url,
+        is_active: !!u.is_active,
       },
     });
-  } catch (e) {
-    console.error('Error en PUT /me:', e);
-    return res.status(500).json({ message: 'Error interno' });
+  } catch (err) {
+    console.error('Error en PUT /me:', err);
+    return res.status(500).json({ message: 'Error al actualizar perfil' });
   }
 });
 
@@ -474,6 +484,7 @@ api.post(
     }
   }
 );
+
 
 
 /* ========================
