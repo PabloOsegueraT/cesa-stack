@@ -283,12 +283,78 @@ api.put('/users/:id/password', requireRoot, async (req, res) => {
  *  Perfil del usuario autenticado
  *  (Root, Admin o Usuario)
  * ====================== */
+/* ========================
+ *  Perfil del usuario actual (root / admin / usuario)
+ * ====================== */
 
-// Obtener mis datos
+// GET /api/me  -> datos del usuario logueado
 api.get('/me', requireAnyAuthenticated, async (req, res) => {
   try {
     const userId = req.authUserId;
 
+    const sql = `
+      SELECT
+        u.id,
+        u.name,
+        u.email,
+        u.phone,
+        u.about,
+        u.avatar_url,
+        u.is_active,
+        r.name AS role
+      FROM users u
+      JOIN roles r ON r.id = u.role_id
+      WHERE u.id = ?
+      LIMIT 1
+    `;
+
+    const [rows] = await pool.execute(sql, [userId]);
+    const list = Array.isArray(rows) ? rows : [];
+
+    if (!list.length) {
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+
+    const u = list[0];
+
+    return res.json({
+      user: {
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        role: (u.role || '').toLowerCase(), // 'root' | 'admin' | 'usuario'
+        phone: u.phone,
+        about: u.about,
+        avatar_url: u.avatar_url,
+        is_active: !!u.is_active,
+      },
+    });
+  } catch (err) {
+    console.error('Error en GET /me:', err);
+    return res.status(500).json({ message: 'Error al obtener perfil' });
+  }
+});
+
+// PUT /api/me  -> actualizar perfil básico (nombre, teléfono, about, avatar_url)
+api.put('/me', requireAnyAuthenticated, async (req, res) => {
+  try {
+    const userId = req.authUserId;
+    const { name, phone, about, avatar_url } = req.body ?? {};
+
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ message: 'name es requerido' });
+    }
+
+    await pool.execute(
+      `
+        UPDATE users
+        SET name = ?, phone = ?, about = ?, avatar_url = ?
+        WHERE id = ?
+      `,
+      [String(name).trim(), phone || null, about || null, avatar_url || null, userId]
+    );
+
+    // devolvemos el perfil actualizado
     const [rows] = await pool.execute(
       `
         SELECT
@@ -297,6 +363,8 @@ api.get('/me', requireAnyAuthenticated, async (req, res) => {
           u.email,
           u.phone,
           u.about,
+          u.avatar_url,
+          u.is_active,
           r.name AS role
         FROM users u
         JOIN roles r ON r.id = u.role_id
@@ -312,169 +380,24 @@ api.get('/me', requireAnyAuthenticated, async (req, res) => {
     }
 
     const u = list[0];
+
     return res.json({
       user: {
         id: u.id,
         name: u.name,
         email: u.email,
+        role: (u.role || '').toLowerCase(),
         phone: u.phone,
         about: u.about,
-        role: u.role, // 'root' | 'admin' | 'usuario' según tengas en roles
+        avatar_url: u.avatar_url,
+        is_active: !!u.is_active,
       },
     });
-  } catch (e) {
-    console.error('Error en GET /me:', e);
-    return res.status(500).json({ message: 'Error interno' });
+  } catch (err) {
+    console.error('Error en PUT /me:', err);
+    return res.status(500).json({ message: 'Error al actualizar perfil' });
   }
 });
-
-// Actualizar MIS datos (no los de todos)
-api.put('/me', requireAnyAuthenticated, async (req, res) => {
-  try {
-    const userId = req.authUserId;
-    const { name, phone, about } = req.body ?? {};
-
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ message: 'name es requerido' });
-    }
-
-    // 👇 MUY IMPORTANTE: WHERE id = ?
-    await pool.execute(
-      `
-        UPDATE users
-        SET
-          name  = ?,
-          phone = ?,
-          about = ?
-        WHERE id = ?
-      `,
-      [
-        String(name).trim(),
-        phone ?? null,
-        about ?? null,
-        userId,
-      ]
-    );
-
-    // Devolvemos el usuario actualizado
-    const [rows] = await pool.execute(
-      `
-        SELECT
-          u.id,
-          u.name,
-          u.email,
-          u.phone,
-          u.about,
-          r.name AS role
-        FROM users u
-        JOIN roles r ON r.id = u.role_id
-        WHERE u.id = ?
-        LIMIT 1
-      `,
-      [userId]
-    );
-
-    const list = Array.isArray(rows) ? rows : [];
-    if (!list.length) {
-      return res.status(404).json({ message: 'Usuario no encontrado luego de actualizar' });
-    }
-
-    const u = list[0];
-    return res.json({
-      user: {
-        id: u.id,
-        name: u.name,
-        email: u.email,
-        phone: u.phone,
-        about: u.about,
-        role: u.role,
-      },
-    });
-  } catch (e) {
-    console.error('Error en PUT /me:', e);
-    return res.status(500).json({ message: 'Error interno' });
-  }
-});
-
-// POST /api/me/avatar  -> subir foto de perfil (archivo)
-api.post(
-  '/me/avatar',
-  requireAnyAuthenticated,
-  avatarUpload.single('avatar'),
-  async (req, res) => {
-    try {
-      const userId = req.authUserId;
-
-      if (!req.file) {
-        return res.status(400).json({ message: 'Archivo no recibido' });
-      }
-
-      const publicBase = process.env.PUBLIC_BASE_URL || '';
-      let avatarUrl;
-
-      if (publicBase) {
-        // Si tienes dominio tipo https://mi-api.com
-        const relative = path
-          .relative(process.cwd(), req.file.path)
-          .replace(/\\/g, '/');
-        avatarUrl = `${publicBase}/${relative}`;
-      } else {
-        // URL relativa (se sirve con app.use('/uploads', ...))
-        avatarUrl = `/uploads/avatars/${path.basename(req.file.path)}`;
-      }
-
-      // Guardar la URL en la BD
-      await pool.execute(
-        'UPDATE users SET avatar_url = ? WHERE id = ?',
-        [avatarUrl, userId]
-      );
-
-      // Devolver el usuario actualizado
-      const [rows] = await pool.execute(
-        `
-          SELECT
-            u.id,
-            u.name,
-            u.email,
-            u.phone,
-            u.about,
-            u.avatar_url,
-            u.is_active,
-            r.name AS role
-          FROM users u
-          JOIN roles r ON r.id = u.role_id
-          WHERE u.id = ?
-          LIMIT 1
-        `,
-        [userId]
-      );
-
-      const list = Array.isArray(rows) ? rows : [];
-      if (!list.length) {
-        return res.status(404).json({ message: 'Usuario no encontrado' });
-      }
-
-      const u = list[0];
-
-      return res.json({
-        user: {
-          id: u.id,
-          name: u.name,
-          email: u.email,
-          role: (u.role || '').toLowerCase(), // root | admin | usuario
-          phone: u.phone,
-          about: u.about,
-          avatar_url: u.avatar_url,
-          is_active: !!u.is_active,
-        },
-      });
-    } catch (err) {
-      console.error('Error en POST /me/avatar:', err);
-      return res.status(500).json({ message: 'Error al subir avatar' });
-    }
-  }
-);
-
 
 /* ========================
  *  Mapeos de tareas (IDs reales de tu BD)
