@@ -333,6 +333,210 @@ api.post('/auth/forgot', async (req, res) => {
   }
 });
 
+// ============================
+//  Notificaciones - listar
+// ============================
+// GET /api/notifications
+api.get('/notifications', requireAnyAuthenticated, async (req, res) => {
+  try {
+    const userId = req.authUserId;   // viene de requireAnyAuthenticated
+    const role   = req.authRole;     // 'root' | 'admin' | 'usuario'
+
+    // Construimos el SQL con filtro por usuario
+    let sql = `
+      SELECT
+        n.id,
+        n.title,
+        n.body,
+        n.created_at,
+        nr.is_read,
+        nt.name AS type_name,
+        n.task_id,
+        n.forum_id
+      FROM notification_recipients nr
+      JOIN notifications n
+        ON n.id = nr.notification_id
+      JOIN notification_types nt
+        ON nt.id = n.type_id
+      WHERE nr.user_id = ?
+    `;
+
+    const params = [userId];
+
+    if (role !== 'root') {
+      sql += ` AND nt.name <> ?`;
+      params.push('restablecer_contraseña');
+    }
+
+    sql += ` ORDER BY n.created_at DESC`;
+
+    const [rows] = await pool.query(sql, params);
+    const list = Array.isArray(rows) ? rows : [];
+
+    const notifications = list.map((row) => {
+      // nt.name puede ser: 'actividad_tarea', 'restablecer_contraseña', 'foro', etc.
+      let type = 'activity';
+      const raw = (row.type_name || '').toString().toLowerCase();
+
+      if (raw.includes('restablecer') || raw.includes('contraseña')) {
+        type = 'password_reset';
+      } else if (raw.includes('foro')) {
+        type = 'forum';
+      } else {
+        type = 'activity';
+      }
+
+      return {
+        id: row.id,
+        title: row.title,
+        body: row.body,
+        created_at: row.created_at,
+        type,                        // <- lo mapea tu NotificationsController
+        is_read: row.is_read === 1,
+        task_id: row.task_id,
+        forum_id: row.forum_id,
+      };
+    });
+
+    return res.json({ notifications });
+  } catch (err) {
+    console.error('Error en GET /api/notifications', err);
+    return res.status(500).json({ message: 'Error interno' });
+  }
+});
+
+api.post('/notifications/mark-all-read', requireAnyAuthenticated, async (req, res) => {
+  try {
+    const userId = req.authUserId; // viene de requireAnyAuthenticated
+
+    const [result] = await pool.query(
+      `
+      UPDATE notification_recipients
+      SET is_read = 1,
+          read_at = NOW()
+      WHERE user_id = ? AND is_read = 0
+      `,
+      [userId],
+    );
+
+    const updated = result.affectedRows || 0;
+
+    return res.json({ ok: true, updated });
+  } catch (err) {
+    console.error('Error en POST /api/notifications/mark-all-read', err);
+    return res.status(500).json({ message: 'Error interno' });
+  }
+});
+
+// DELETE /api/notifications/:id
+// Elimina la notificación SOLO para el usuario autenticado
+api.delete('/notifications/:id', requireAnyAuthenticated, async (req, res) => {
+  try {
+    const userId = req.authUserId;
+    const notifId = Number(req.params.id);
+
+    if (!notifId) {
+      return res.status(400).json({ message: 'id inválido' });
+    }
+
+    // 1) Borrar el registro en notification_recipients
+    const [result] = await pool.query(
+      `
+      DELETE FROM notification_recipients
+      WHERE notification_id = ? AND user_id = ?
+      `,
+      [notifId, userId]
+    );
+
+    if (!result.affectedRows) {
+      // No había registro para ese usuario / notificación
+      return res.status(404).json({ message: 'Notificación no encontrada' });
+    }
+
+    // 2) (Opcional) si nadie más la tiene, borrar la notificación base
+    await pool.query(
+      `
+      DELETE FROM notifications
+      WHERE id = ?
+        AND NOT EXISTS (
+          SELECT 1
+          FROM notification_recipients nr
+          WHERE nr.notification_id = notifications.id
+        )
+      `,
+      [notifId]
+    );
+
+    return res.status(204).end();
+  } catch (err) {
+    console.error('Error en DELETE /api/notifications/:id', err);
+    return res.status(500).json({ message: 'Error interno' });
+  }
+});
+
+// ============================
+//  Notificaciones - marcar como leídas
+// ============================
+
+// Marcar UNA notificación como leída
+// PUT /api/notifications/:id/read
+api.put('/notifications/:id/read', requireAnyAuthenticated, async (req, res) => {
+  try {
+    const userId = req.authUserId;
+    const notifId = Number(req.params.id);
+
+    if (!notifId) {
+      return res.status(400).json({ message: 'id inválido' });
+    }
+
+    const [result] = await pool.query(
+      `
+      UPDATE notification_recipients
+      SET is_read = 1,
+          read_at = NOW()
+      WHERE notification_id = ?
+        AND user_id = ?
+      `,
+      [notifId, userId],
+    );
+
+    return res.json({
+      ok: true,
+      affected: result.affectedRows || 0,
+    });
+  } catch (err) {
+    console.error('Error en PUT /api/notifications/:id/read', err);
+    return res.status(500).json({ message: 'Error interno' });
+  }
+});
+
+// Marcar TODAS las notificaciones del usuario como leídas
+// PUT /api/notifications/read-all
+api.put('/notifications/read-all', requireAnyAuthenticated, async (req, res) => {
+  try {
+    const userId = req.authUserId;
+
+    const [result] = await pool.query(
+      `
+      UPDATE notification_recipients
+      SET is_read = 1,
+          read_at = NOW()
+      WHERE user_id = ?
+        AND is_read = 0
+      `,
+      [userId],
+    );
+
+    return res.json({
+      ok: true,
+      affected: result.affectedRows || 0,
+    });
+  } catch (err) {
+    console.error('Error en PUT /api/notifications/read-all', err);
+    return res.status(500).json({ message: 'Error interno' });
+  }
+});
+
 /* ========================
  *  Catálogos
  * ====================== */
