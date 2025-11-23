@@ -444,6 +444,55 @@ api.get('/users', requireAdminOrRoot, async (req, res) => {
   }
 });
 
+// --- Perfil de cualquier usuario (solo root/admin) ---
+api.get('/users/:userId/profile', async (req, res) => {
+  try {
+    const role = req.headers['x-role'];
+    if (role !== 'root' && role !== 'admin') {
+      return res
+        .status(403)
+        .json({ message: 'Solo root o admin pueden ver perfiles de otros usuarios' });
+    }
+
+    const userId = Number.parseInt(req.params.userId, 10) || 0;
+    if (!userId) {
+      return res.status(400).json({ message: 'userId inválido' });
+    }
+
+    // Ajusta nombres de tabla / columnas a tu esquema real
+    const [rows] = await pool.query(
+          `
+          SELECT
+            u.id,
+            u.name,
+            u.email,
+            u.phone,
+            u.about,
+            u.avatar_url,
+            u.is_active,
+            r.name AS role
+          FROM users u
+          JOIN roles r ON r.id = u.role_id
+          WHERE u.id = ?
+          LIMIT 1
+        `,
+          [userId]
+        );
+
+
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+
+    // devolvemos el objeto tal cual espera Flutter
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error('GET /api/users/:userId/profile error', err);
+    return res.status(500).json({ message: 'Error interno' });
+  }
+});
+
 // Eliminar usuario (solo root)
 api.delete('/users/:id', requireRoot, async (req, res) => {
   try {
