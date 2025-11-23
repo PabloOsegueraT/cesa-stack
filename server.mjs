@@ -9,72 +9,41 @@ import multer from 'multer';
 import path from 'node:path';
 import fs from 'node:fs';
 
-/* ========================
- *  Configuración uploads (avatares)
- * ====================== */
-
-const avatarsDir =
-  process.env.AVATARS_DIR || path.join(process.cwd(), 'uploads', 'avatars');
-
-// Nos aseguramos de que exista la carpeta
+// ========================
+//  Config uploads (avatares)
+// ========================
+const uploadsRoot = path.join(process.cwd(), 'uploads');
+const avatarsDir  = path.join(uploadsRoot, 'avatars');
 fs.mkdirSync(avatarsDir, { recursive: true });
 
-// Storage de multer para guardar archivos en disco
 const avatarStorage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, avatarsDir),
   filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || '');
+    const ext  = path.extname(file.originalname || '');
     const name = crypto.randomBytes(16).toString('hex');
     cb(null, `${name}${ext}`);
   },
 });
 
-// Límite de tamaño y validación de tipo
 const avatarUpload = multer({
   storage: avatarStorage,
-  limits: {
-    fileSize: 15 * 1024 * 1024, // 15 MB
-  },
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
   fileFilter: (_req, file, cb) => {
-    const mime = file.mimetype || '';
-    const original = (file.originalname || '').toLowerCase();
-    console.log('MIME recibido en /me/avatar:', mime, 'archivo:', original);
-
-    // 1) Si viene como image/*, lo aceptamos directo
-    if (mime.startsWith('image/')) {
-      return cb(null, true);
+    if (!file.mimetype || !file.mimetype.startsWith('image/')) {
+      return cb(new Error('Solo se permiten imágenes'));
     }
-
-    // 2) A veces llega como application/octet-stream en web:
-    //    validamos por extensión
-    const okExt =
-      original.endsWith('.jpg') ||
-      original.endsWith('.jpeg') ||
-      original.endsWith('.png') ||
-      original.endsWith('.gif') ||
-      original.endsWith('.webp');
-
-    if (okExt) {
-      return cb(null, true);
-    }
-
-    return cb(new Error('Solo se permiten imágenes'));
+    cb(null, true);
   },
 });
 
-/* ========================
- *  App base
- * ====================== */
-
+// ========================
+//  App base
+// ========================
 const app = express();
-
-// Servir archivos estáticos (avatares, etc.)
-app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
 /* ========================
  *  Middlewares base
  * ====================== */
-
 const allowOrigin = process.env.CORS_ALLOW_ORIGIN || '*';
 app.use(
   cors({
@@ -82,8 +51,9 @@ app.use(
     credentials: false,
     allowedHeaders: ['Content-Type', 'x-role', 'x-user-id'],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  }),
+  })
 );
+
 app.use(express.json({ limit: '30mb' }));
 
 // Logger simple
@@ -92,12 +62,21 @@ app.use((req, _res, next) => {
   next();
 });
 
+// Servir /uploads con CORS (para las imágenes)
+app.use(
+  '/uploads',
+  (req, res, next) => {
+    res.header('Access-Control-Allow-Origin', allowOrigin || '*');
+    next();
+  },
+  express.static(uploadsRoot)
+);
+
 const api = express.Router();
 
 /* ========================
  *  Rutas públicas
  * ====================== */
-
 api.get('/health', (_req, res) => res.json({ ok: true }));
 
 // Login básico: devuelve { user: { id, name, email, role } }
@@ -105,7 +84,9 @@ api.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body ?? {};
     if (!email || !password) {
-      return res.status(400).json({ message: 'email y password requeridos' });
+      return res
+        .status(400)
+        .json({ message: 'email y password requeridos' });
     }
 
     const sql = `
@@ -117,16 +98,21 @@ api.post('/auth/login', async (req, res) => {
     `;
     const [rows] = await pool.execute(sql, [email]);
     const list = Array.isArray(rows) ? rows : [];
-    if (!list.length) return res.status(401).json({ message: 'Credenciales inválidas' });
+    if (!list.length)
+      return res.status(401).json({ message: 'Credenciales inválidas' });
 
     const u = list[0];
-    if (!u.is_active) return res.status(403).json({ message: 'Usuario inactivo' });
+    if (!u.is_active)
+      return res.status(403).json({ message: 'Usuario inactivo' });
 
     const ok = await bcrypt.compare(password, u.password_hash);
-    if (!ok) return res.status(401).json({ message: 'Credenciales inválidas' });
+    if (!ok)
+      return res.status(401).json({ message: 'Credenciales inválidas' });
 
     const role = String(u.role || '').toLowerCase(); // 'root' | 'admin' | 'usuario'
-    return res.json({ user: { id: u.id, name: u.name, email: u.email, role } });
+    return res.json({
+      user: { id: u.id, name: u.name, email: u.email, role },
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: 'Error interno' });
@@ -137,20 +123,23 @@ api.post('/auth/login', async (req, res) => {
  *  Helpers / Middlewares
  * ====================== */
 
-// Solo root
 function requireRoot(req, res, next) {
   const role = String(req.header('x-role') || '').toLowerCase();
   if (role !== 'root') {
-    return res.status(403).json({ message: 'Solo root puede realizar esta acción' });
+    return res
+      .status(403)
+      .json({ message: 'Solo root puede realizar esta acción' });
   }
   next();
 }
 
-// Root o admin
+// Para rutas donde root o admin pueden entrar
 function requireAdminOrRoot(req, res, next) {
   const role = String(req.header('x-role') || '').toLowerCase();
   if (role !== 'root' && role !== 'admin') {
-    return res.status(403).json({ message: 'Solo admin o root pueden realizar esta acción' });
+    return res
+      .status(403)
+      .json({ message: 'Solo admin o root pueden realizar esta acción' });
   }
   next();
 }
@@ -174,7 +163,10 @@ function requireAnyAuthenticated(req, res, next) {
 }
 
 async function getRoleIdByName(name) {
-  const [rows] = await pool.execute('SELECT id FROM roles WHERE name = ? LIMIT 1', [name]);
+  const [rows] = await pool.execute(
+    'SELECT id FROM roles WHERE name = ? LIMIT 1',
+    [name]
+  );
   const list = Array.isArray(rows) ? rows : [];
   return list.length ? list[0].id : null;
 }
@@ -182,10 +174,11 @@ async function getRoleIdByName(name) {
 /* ========================
  *  Catálogos
  * ====================== */
-
 api.get('/roles', async (_req, res) => {
   try {
-    const [rows] = await pool.execute('SELECT id, name FROM roles ORDER BY id');
+    const [rows] = await pool.execute(
+      'SELECT id, name FROM roles ORDER BY id'
+    );
     res.json({ roles: Array.isArray(rows) ? rows : [] });
   } catch (e) {
     console.error(e);
@@ -212,7 +205,9 @@ api.post('/users', requireRoot, async (req, res) => {
     } = req.body ?? {};
 
     if (!name || !email || !password) {
-      return res.status(400).json({ message: 'name, email y password son requeridos' });
+      return res
+        .status(400)
+        .json({ message: 'name, email y password son requeridos' });
     }
 
     const roleName = String(role).toLowerCase();
@@ -221,10 +216,15 @@ api.post('/users', requireRoot, async (req, res) => {
     }
 
     const roleId = await getRoleIdByName(roleName);
-    if (!roleId) return res.status(400).json({ message: `Rol no configurado: ${roleName}` });
+    if (!roleId)
+      return res
+        .status(400)
+        .json({ message: `Rol no configurado: ${roleName}` });
 
-    // ¿email ya existe?
-    const [dups] = await pool.execute('SELECT 1 FROM users WHERE email=? LIMIT 1', [email]);
+    const [dups] = await pool.execute(
+      'SELECT 1 FROM users WHERE email=? LIMIT 1',
+      [email]
+    );
     if (Array.isArray(dups) && dups.length) {
       return res.status(409).json({ message: 'Email ya registrado' });
     }
@@ -232,9 +232,11 @@ api.post('/users', requireRoot, async (req, res) => {
     const hash = await bcrypt.hash(password, 10);
 
     const [result] = await pool.execute(
-      `INSERT INTO users (role_id, name, email, password_hash, phone, about, avatar_url, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [roleId, name, email, hash, phone, about, avatar_url, is_active ? 1 : 0],
+      `
+      INSERT INTO users (role_id, name, email, password_hash, phone, about, avatar_url, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+      [roleId, name, email, hash, phone, about, avatar_url, is_active ? 1 : 0]
     );
 
     res.status(201).json({
@@ -255,12 +257,13 @@ api.post('/users', requireRoot, async (req, res) => {
   }
 });
 
-// Listar usuarios (root o admin) con filtro opcional ?q=
+// Listar usuarios (root o admin)
 api.get('/users', requireAdminOrRoot, async (req, res) => {
   try {
     const q = (req.query.q || '').toString().trim();
     let sql = `
-      SELECT u.id, u.name, u.email, u.is_active, r.name AS role, u.phone, u.about, u.avatar_url
+      SELECT u.id, u.name, u.email, u.is_active, r.name AS role,
+             u.phone, u.about, u.avatar_url
       FROM users u
       JOIN roles r ON r.id = u.role_id
     `;
@@ -298,10 +301,16 @@ api.put('/users/:id/password', requireRoot, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const { password } = req.body ?? {};
-    if (!id || !password) return res.status(400).json({ message: 'id y password requeridos' });
+    if (!id || !password)
+      return res
+        .status(400)
+        .json({ message: 'id y password requeridos' });
 
     const hash = await bcrypt.hash(password, 10);
-    await pool.execute('UPDATE users SET password_hash = ? WHERE id = ?', [hash, id]);
+    await pool.execute('UPDATE users SET password_hash = ? WHERE id = ?', [
+      hash,
+      id,
+    ]);
 
     res.json({ ok: true });
   } catch (e) {
@@ -314,7 +323,7 @@ api.put('/users/:id/password', requireRoot, async (req, res) => {
  *  Perfil del usuario actual
  * ====================== */
 
-// GET /api/me  -> datos del usuario logueado
+// GET /api/me
 api.get('/me', requireAnyAuthenticated, async (req, res) => {
   try {
     const userId = req.authUserId;
@@ -349,7 +358,7 @@ api.get('/me', requireAnyAuthenticated, async (req, res) => {
         id: u.id,
         name: u.name,
         email: u.email,
-        role: (u.role || '').toLowerCase(), // root | admin | usuario
+        role: (u.role || '').toLowerCase(),
         phone: u.phone,
         about: u.about,
         avatar_url: u.avatar_url,
@@ -362,8 +371,7 @@ api.get('/me', requireAnyAuthenticated, async (req, res) => {
   }
 });
 
-// PUT /api/me  -> actualizar perfil básico
-// (YA NO toca avatar_url, eso solo se maneja en POST /me/avatar)
+// PUT /api/me  -> actualizar nombre/phone/about
 api.put('/me', requireAnyAuthenticated, async (req, res) => {
   try {
     const userId = req.authUserId;
@@ -375,31 +383,30 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
 
     await pool.execute(
       `
-        UPDATE users
-        SET name = ?, phone = ?, about = ?
-        WHERE id = ?
-      `,
-      [String(name).trim(), phone || null, about || null, userId],
+      UPDATE users
+      SET name = ?, phone = ?, about = ?
+      WHERE id = ?
+    `,
+      [String(name).trim(), phone || null, about || null, userId]
     );
 
-    // Devolvemos el perfil actualizado
     const [rows] = await pool.execute(
       `
-        SELECT
-          u.id,
-          u.name,
-          u.email,
-          u.phone,
-          u.about,
-          u.avatar_url,
-          u.is_active,
-          r.name AS role
-        FROM users u
-        JOIN roles r ON r.id = u.role_id
-        WHERE u.id = ?
-        LIMIT 1
-      `,
-      [userId],
+      SELECT
+        u.id,
+        u.name,
+        u.email,
+        u.phone,
+        u.about,
+        u.avatar_url,
+        u.is_active,
+        r.name AS role
+      FROM users u
+      JOIN roles r ON r.id = u.role_id
+      WHERE u.id = ?
+      LIMIT 1
+    `,
+      [userId]
     );
 
     const list = Array.isArray(rows) ? rows : [];
@@ -429,26 +436,11 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
   }
 });
 
-// POST /api/me/avatar  -> subir foto de perfil (archivo)
+// POST /api/me/avatar  -> subir foto
 api.post(
   '/me/avatar',
   requireAnyAuthenticated,
-  (req, res, next) => {
-    avatarUpload.single('avatar')(req, res, (err) => {
-      if (err) {
-        console.error('Error de multer en /me/avatar:', err);
-        if (err.code === 'LIMIT_FILE_SIZE') {
-          return res
-            .status(400)
-            .json({ message: 'La imagen es demasiado grande (máx 15 MB)' });
-        }
-        return res
-          .status(400)
-          .json({ message: err.message || 'Error al procesar la imagen' });
-      }
-      next();
-    });
-  },
+  avatarUpload.single('avatar'),
   async (req, res) => {
     try {
       const userId = req.authUserId;
@@ -461,40 +453,36 @@ api.post(
       let avatarUrl;
 
       if (publicBase) {
-        // URL absoluta: https://mi-api.com/uploads/avatars/...
         const relative = path
           .relative(process.cwd(), req.file.path)
           .replace(/\\/g, '/');
         avatarUrl = `${publicBase}/${relative}`;
       } else {
-        // URL relativa (la app debe anteponer Env.apiBaseUrl)
         avatarUrl = `/uploads/avatars/${path.basename(req.file.path)}`;
       }
 
-      // Guardar la URL en la BD
       await pool.execute(
         'UPDATE users SET avatar_url = ? WHERE id = ?',
-        [avatarUrl, userId],
+        [avatarUrl, userId]
       );
 
-      // Devolver el usuario actualizado
       const [rows] = await pool.execute(
         `
-          SELECT
-            u.id,
-            u.name,
-            u.email,
-            u.phone,
-            u.about,
-            u.avatar_url,
-            u.is_active,
-            r.name AS role
-          FROM users u
-          JOIN roles r ON r.id = u.role_id
-          WHERE u.id = ?
-          LIMIT 1
-        `,
-        [userId],
+        SELECT
+          u.id,
+          u.name,
+          u.email,
+          u.phone,
+          u.about,
+          u.avatar_url,
+          u.is_active,
+          r.name AS role
+        FROM users u
+        JOIN roles r ON r.id = u.role_id
+        WHERE u.id = ?
+        LIMIT 1
+      `,
+        [userId]
       );
 
       const list = Array.isArray(rows) ? rows : [];
@@ -509,7 +497,7 @@ api.post(
           id: u.id,
           name: u.name,
           email: u.email,
-          role: (u.role || '').toLowerCase(), // root | admin | usuario
+          role: (u.role || '').toLowerCase(),
           phone: u.phone,
           about: u.about,
           avatar_url: u.avatar_url,
@@ -520,48 +508,38 @@ api.post(
       console.error('Error en POST /me/avatar:', err);
       return res.status(500).json({ message: 'Error al subir avatar' });
     }
-  },
+  }
 );
 
-/* ========================
- *  Mapeos de tareas (IDs reales de tu BD)
- * ====================== */
+// ========================
+//  Mapeos de tareas
+// ========================
 
-// task_status.id
-// 1 = pendiente
-// 2 = en_proceso
-// 3 = completada
-// 4 = no_lograda
 const STATUS_IDS = {
   pending: 1,
   in_progress: 2,
   done: 3,
 };
 
-// Para leer desde la BD (tasks.current_status_id -> código que usa Flutter)
 const STATUS_CODES = {
   1: 'pending',
   2: 'in_progress',
   3: 'done',
-  4: 'done', // 'no_lograda' la tratamos como done por ahora
+  4: 'done',
 };
 
-// priorities.id
-// 1 = baja
-// 2 = media
-// 3 = alta
 const PRIORITY_CODES = {
   1: 'low',
   2: 'medium',
   3: 'high',
 };
 
-// Para insertar desde el body JSON de Flutter
 const PRIORITY_IDS = {
   low: 1,
   medium: 2,
   high: 3,
 };
+
 
 /* ========================
  *  Tareas (admin / root + usuarios)
