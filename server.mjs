@@ -175,19 +175,26 @@ async function getRoleIdByName(name) {
 // Helpers de notificaciones
 // ========================
 
-// Obtener el id del tipo de notificación por nombre
-async function getNotificationTypeIdByName(name) {
+// ✅ Asegura que exista el tipo de notificación y devuelve su id
+async function ensureNotificationTypeId(name) {
   const [rows] = await pool.execute(
     'SELECT id FROM notification_types WHERE name = ? LIMIT 1',
     [name],
   );
   const list = Array.isArray(rows) ? rows : [];
-  return list.length ? list[0].id : null;
+  if (list.length) return list[0].id;
+
+  // Si no existe, lo creamos
+  const [ins] = await pool.execute(
+    'INSERT INTO notification_types (name) VALUES (?)',
+    [name],
+  );
+  return ins.insertId;
 }
 
 /**
  * Crea una notificación y sus destinatarios.
- * - typeName: 'restablecer_contraseña'
+ * - typeName: 'actividad_tarea', 'restablecer_contraseña', 'foro', etc.
  * - title, body: textos a mostrar
  * - createdBy: id del usuario que originó la notificación (o null si sistema)
  * - recipients: array de user_id que recibirán la notificación
@@ -204,9 +211,10 @@ async function createNotificationWithRecipients({
 }) {
   if (!recipients.length) return;
 
-  const typeId = await getNotificationTypeIdByName(typeName);
+  // 👇 ahora siempre asegura que el tipo exista
+  const typeId = await ensureNotificationTypeId(typeName);
   if (!typeId) {
-    console.error('Tipo de notificación no encontrado:', typeName);
+    console.error('No se pudo obtener/crear tipo de notificación:', typeName);
     return;
   }
 
@@ -1075,9 +1083,10 @@ api.post('/tasks', requireAdminOrRoot, async (req, res) => {
           [taskId, assigneeId],
         );
 
-        const [uRows] = await conn.query('SELECT name FROM users WHERE id = ? LIMIT 1', [
-          assigneeId,
-        ]);
+        const [uRows] = await conn.query(
+          'SELECT name FROM users WHERE id = ? LIMIT 1',
+          [assigneeId],
+        );
         const uList = Array.isArray(uRows) ? uRows : [];
         if (uList.length) {
           assigneeName = uList[0].name;
@@ -1094,6 +1103,26 @@ api.post('/tasks', requireAdminOrRoot, async (req, res) => {
       );
 
       await conn.commit();
+
+      // ✅ 4) NOTIFICACIÓN: si hay assigneeId, le avisamos
+      if (assigneeId) {
+        try {
+          const dueText = dueDate ? ` con fecha límite ${dueDate}` : '';
+          await createNotificationWithRecipients({
+            typeName: 'actividad_tarea', // se crea solo si no existe
+            title: 'Nueva tarea asignada',
+            body: `Se te ha asignado la tarea "${title}"${dueText}.`,
+            createdBy,
+            recipients: [assigneeId],
+            taskId,
+          });
+        } catch (notifyErr) {
+          console.error(
+            'Error creando notificación de asignación de tarea:',
+            notifyErr,
+          );
+        }
+      }
 
       // Respuesta alineada con Task.fromJson
       return res.status(201).json({
@@ -1142,9 +1171,9 @@ api.put('/tasks/:id/status', requireAnyAuthenticated, async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    // 1) Leer estado actual
+    // 1) Leer estado actual + título de la tarea
     const [rows] = await conn.query(
-      'SELECT current_status_id FROM tasks WHERE id = ? FOR UPDATE',
+      'SELECT current_status_id, title FROM tasks WHERE id = ? FOR UPDATE',
       [taskId],
     );
     const list = Array.isArray(rows) ? rows : [];
@@ -1153,8 +1182,9 @@ api.put('/tasks/:id/status', requireAnyAuthenticated, async (req, res) => {
       return res.status(404).json({ message: 'Tarea no encontrada' });
     }
     const fromStatusId = list[0].current_status_id;
+    const taskTitle   = list[0].title || `Tarea #${taskId}`;
 
-    // Si es el mismo, no hacemos nada
+    // Si es el mismo estado, no hacemos nada
     if (fromStatusId === newStatusId) {
       await conn.rollback();
       return res.json({ ok: true, noop: true });
@@ -1182,6 +1212,46 @@ api.put('/tasks/:id/status', requireAnyAuthenticated, async (req, res) => {
     );
 
     await conn.commit();
+
+    // 4) 🔔 Notificación: si se marcó como "done", avisar a root + admin
+    if (newStatusId === STATUS_IDS.done) {
+      try {
+        // Nombre de quien cambió el estado
+        const [uRows] = await pool.query(
+          'SELECT name FROM users WHERE id = ? LIMIT 1',
+          [userId],
+        );
+        const uList = Array.isArray(uRows) ? uRows : [];
+        const actorName = uList.length ? uList[0].name : 'Usuario';
+
+        // IDs de admin + root
+        const [adminRows] = await pool.query(
+          `
+            SELECT u.id
+            FROM users u
+            JOIN roles r ON r.id = u.role_id
+            WHERE r.name IN ('admin','root')
+          `,
+        );
+        const adminList = Array.isArray(adminRows) ? adminRows : [];
+        const recipients = adminList
+          .map((r) => r.id)
+          .filter((id) => id && id !== userId); // opcional: no notificarse a sí mismo
+
+        if (recipients.length) {
+          await createNotificationWithRecipients({
+            typeName: 'actividad_tarea', // mismo tipo que usamos al crear tareas
+            title: 'Tarea completada',
+            body: `La tarea "${taskTitle}" fue marcada como completada por ${actorName}.`,
+            createdBy: userId,
+            recipients,
+            taskId,
+          });
+        }
+      } catch (notifyErr) {
+        console.error('Error creando notificación de tarea completada:', notifyErr);
+      }
+    }
 
     return res.json({ ok: true });
   } catch (err) {
