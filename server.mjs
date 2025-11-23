@@ -1543,6 +1543,154 @@ api.put('/me', requireAnyAuthenticated, async (req, res) => {
   }
 });
 
+// ========================
+//  Comentarios de tareas
+// ========================
+
+// GET /api/tasks/:id/comments
+// Lista los comentarios de una tarea en orden cronológico
+api.get('/tasks/:id/comments', requireAnyAuthenticated, async (req, res) => {
+  try {
+    const taskId = Number(req.params.id);
+    const userId = req.authUserId;          // viene del middleware
+    if (!taskId) {
+      return res.status(400).json({ message: 'taskId inválido' });
+    }
+
+    const [rows] = await pool.query(
+      `
+        SELECT
+          c.id,
+          c.task_id     AS taskId,
+          c.user_id     AS userId,
+          c.body        AS body,
+          c.created_at  AS createdAt,
+          u.name        AS author,
+          r.name        AS role,
+          CASE WHEN r.name IN ('admin','root') THEN 1 ELSE 0 END AS isAdmin,
+          CASE WHEN c.user_id = ? THEN 1 ELSE 0 END AS isMine
+        FROM task_comments c
+        JOIN users u ON u.id = c.user_id
+        JOIN roles r ON r.id = u.role_id
+        WHERE c.task_id = ?
+        ORDER BY c.created_at ASC
+      `,
+      [userId, taskId]
+    );
+
+    const list = Array.isArray(rows) ? rows : [];
+    return res.json({ comments: list });
+  } catch (err) {
+    console.error('Error listando comentarios de tarea:', err);
+    return res.status(500).json({ message: 'Error al listar comentarios' });
+  }
+});
+
+// POST /api/tasks/:id/comments
+// Crear un comentario nuevo en la tarea
+// Body JSON: { "body": "texto del comentario" }
+api.post('/tasks/:id/comments', requireAnyAuthenticated, async (req, res) => {
+  try {
+    const taskId = Number(req.params.id);
+    const userId = req.authUserId;
+    const { body } = req.body ?? {};
+
+    if (!taskId) {
+      return res.status(400).json({ message: 'taskId inválido' });
+    }
+    const text = (body ?? '').toString().trim();
+    if (!text) {
+      return res.status(400).json({ message: 'body es requerido' });
+    }
+
+    // Verificar que la tarea exista y no esté archivada
+    const [taskRows] = await pool.query(
+      'SELECT id FROM tasks WHERE id = ? AND archived = 0 LIMIT 1',
+      [taskId]
+    );
+    if (!Array.isArray(taskRows) || taskRows.length === 0) {
+      return res.status(404).json({ message: 'Tarea no encontrada' });
+    }
+
+    const [insertResult] = await pool.query(
+      `
+        INSERT INTO task_comments (task_id, user_id, body)
+        VALUES (?, ?, ?)
+      `,
+      [taskId, userId, text]
+    );
+    const commentId = insertResult.insertId;
+
+    // Devolvemos el comentario completo (con autor, rol, isAdmin, isMine)
+    const [rows] = await pool.query(
+      `
+        SELECT
+          c.id,
+          c.task_id     AS taskId,
+          c.user_id     AS userId,
+          c.body        AS body,
+          c.created_at  AS createdAt,
+          u.name        AS author,
+          r.name        AS role,
+          CASE WHEN r.name IN ('admin','root') THEN 1 ELSE 0 END AS isAdmin,
+          CASE WHEN c.user_id = ? THEN 1 ELSE 0 END AS isMine
+        FROM task_comments c
+        JOIN users u ON u.id = c.user_id
+        JOIN roles r ON r.id = u.role_id
+        WHERE c.id = ?
+        LIMIT 1
+      `,
+      [userId, commentId]
+    );
+
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+      return res.status(500).json({ message: 'No se pudo recuperar el comentario creado' });
+    }
+
+    return res.status(201).json(list[0]);
+  } catch (err) {
+    console.error('Error creando comentario de tarea:', err);
+    return res.status(500).json({ message: 'Error al crear comentario' });
+  }
+});
+
+// DELETE /api/task-comments/:id
+// Opcional: borrar comentario (root/admin o dueño)
+api.delete('/task-comments/:id', requireAnyAuthenticated, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const userId = req.authUserId;
+    const role = req.authRole; // 'root' | 'admin' | 'usuario'
+
+    if (!id) {
+      return res.status(400).json({ message: 'id inválido' });
+    }
+
+    const [rows] = await pool.query(
+      'SELECT user_id FROM task_comments WHERE id = ? LIMIT 1',
+      [id]
+    );
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+      return res.status(404).json({ message: 'Comentario no encontrado' });
+    }
+
+    const ownerId = list[0].user_id;
+
+    // Solo root/admin o el dueño pueden borrar
+    if (role === 'usuario' && ownerId !== userId) {
+      return res.status(403).json({ message: 'No puedes eliminar este comentario' });
+    }
+
+    await pool.query('DELETE FROM task_comments WHERE id = ?', [id]);
+    return res.status(204).end();
+  } catch (err) {
+    console.error('Error borrando comentario de tarea:', err);
+    return res.status(500).json({ message: 'Error al eliminar comentario' });
+  }
+});
+
 /* ========================
  *  Foros (admin / root + chat)
  * ====================== */
