@@ -2604,6 +2604,134 @@ const forumTitle = forumRows[0].title || `Foro #${forumId}`;
   }
 });
 
+// Actualizar foro
+// PUT /api/forums/:id
+// Body opcional: { title?, description?, isPublic? }
+api.put('/forums/:id', requireAdminOrRoot, async (req, res) => {
+  const forumId = Number(req.params.id);
+  if (!forumId) {
+    return res.status(400).json({ message: 'id inválido' });
+  }
+
+  const { title, description, isPublic } = req.body ?? {};
+
+  const headerUserId = Number(req.header('x-user-id'));
+  const actorId = Number.isFinite(headerUserId) ? headerUserId : null;
+
+  let oldTitle = '';
+  let newTitle = '';
+  let recipients = [];
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // 1) Traer foro actual
+    const [forumRows] = await conn.query(
+      'SELECT id, title, description, is_public FROM forums WHERE id = ? FOR UPDATE',
+      [forumId],
+    );
+    const forumList = Array.isArray(forumRows) ? forumRows : [];
+    if (!forumList.length) {
+      await conn.rollback();
+      return res.status(404).json({ message: 'Foro no encontrado' });
+    }
+
+    const current = forumList[0];
+    oldTitle = current.title || `Foro #${forumId}`;
+
+    // 2) Calcular valores nuevos
+    const newTitleDb = title ?? current.title;
+    const newDescDb = description ?? current.description;
+    const newIsPublicDb =
+      typeof isPublic === 'boolean' ? (isPublic ? 1 : 0) : current.is_public;
+
+    newTitle = newTitleDb;
+
+    // 3) Actualizar foro
+    await conn.query(
+      `
+        UPDATE forums
+        SET title = ?, description = ?, is_public = ?
+        WHERE id = ?
+      `,
+      [newTitleDb, newDescDb, newIsPublicDb, forumId],
+    );
+
+    // 4) Miembros del foro (si existe tabla forum_members)
+    const [memberRows] = await conn.query(
+      'SELECT user_id FROM forum_members WHERE forum_id = ?',
+      [forumId],
+    );
+    const memberIds = (Array.isArray(memberRows) ? memberRows : []).map(
+      (r) => r.user_id,
+    );
+
+    // 5) Admin + root
+    const [adminRows] = await conn.query(
+      `
+        SELECT u.id
+        FROM users u
+        JOIN roles r ON r.id = u.role_id
+        WHERE r.name IN ('admin','root')
+      `,
+    );
+    const adminIds = (Array.isArray(adminRows) ? adminRows : []).map(
+      (r) => r.id,
+    );
+
+    // 6) Recipientes: miembros + admin/root
+    recipients = [...new Set([...memberIds, ...adminIds])];
+    if (actorId) {
+      recipients = recipients.filter((id) => id !== actorId);
+    }
+
+    await conn.commit();
+
+    return res.json({
+      id: forumId,
+      title: newTitleDb,
+      description: newDescDb,
+      isPublic: !!newIsPublicDb,
+    });
+  } catch (err) {
+    await conn.rollback();
+    console.error('Error actualizando foro', err);
+    return res
+      .status(500)
+      .json({ message: 'Error interno al actualizar foro' });
+  } finally {
+    conn.release();
+  }
+
+  // 7) Notificación después de actualizar
+  try {
+    if (recipients.length) {
+      let actorName = 'Alguien';
+      if (actorId) {
+        const [uRows] = await pool.query(
+          'SELECT name FROM users WHERE id = ? LIMIT 1',
+          [actorId],
+        );
+        const uList = Array.isArray(uRows) ? uRows : [];
+        if (uList.length) actorName = uList[0].name;
+      }
+
+      const tituloMostrar = newTitle || oldTitle;
+
+      await createNotificationWithRecipients({
+        typeName: 'foro_actualizado',
+        title: 'Foro actualizado',
+        body: `${actorName} actualizó el foro "${tituloMostrar}".`,
+        createdBy: actorId,
+        recipients,
+        forumId, // aquí sí puede ir el id porque el foro sigue existiendo
+      });
+    }
+  } catch (notifyErr) {
+    console.error('Error creando notificación de foro actualizado:', notifyErr);
+  }
+});
 
 // DELETE /api/forums/:id  -> admin o root pueden borrar el foro y sus mensajes
 // Además envía notificación a admin/root + miembros
@@ -2703,8 +2831,9 @@ api.delete('/forums/:id', requireAdminOrRoot, async (req, res) => {
         body: `${actorName} eliminó el foro "${forumTitle}".`,
         createdBy: actorId,
         recipients,
-        forumId,
+        forumId: null,     // ✅ ya no referencia a un foro borrado
       });
+
     }
   } catch (notifyErr) {
     console.error('Error creando notificación de foro eliminado:', notifyErr);
