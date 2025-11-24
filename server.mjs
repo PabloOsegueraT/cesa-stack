@@ -251,6 +251,41 @@ async function createNotificationWithRecipients({
   }
 }
 
+// Destinatarios de notificaciones de foro:
+// - Si hay miembros en forum_members -> ellos (menos el autor)
+// - Si no hay miembros (foro público) -> admin + root (menos el autor)
+async function getForumNotificationRecipients(forumId, excludeUserId = null) {
+  const [memRows] = await pool.query(
+    `
+      SELECT user_id
+      FROM forum_members
+      WHERE forum_id = ?
+    `,
+    [forumId],
+  );
+  let ids = Array.isArray(memRows) ? memRows.map((r) => r.user_id) : [];
+
+  if (!ids.length) {
+    const [adminRows] = await pool.query(
+      `
+        SELECT u.id
+        FROM users u
+        JOIN roles r ON r.id = u.role_id
+        WHERE r.name IN ('admin','root')
+      `,
+    );
+    ids = Array.isArray(adminRows) ? adminRows.map((r) => r.id) : [];
+  }
+
+  if (excludeUserId) {
+    ids = ids.filter((id) => id !== excludeUserId);
+  }
+
+  // quitar duplicados por si acaso
+  return [...new Set(ids)];
+}
+
+
 // POST /api/auth/forgot
 // Body: { "email": "usuario@demo.com" }
 api.post('/auth/forgot', async (req, res) => {
@@ -2030,7 +2065,7 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    // 1) Insertar el foro
+    // 1) Crear foro
     const [forumResult] = await conn.query(
       `
         INSERT INTO forums (title, description, is_public, created_by)
@@ -2041,8 +2076,10 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
 
     const forumId = forumResult.insertId;
 
-    // 2) Si NO es público, insertar miembros
+    // 2) Miembros (si es privado)
     let members = [];
+    let memberIds = [];
+
     if (!isPublic && Array.isArray(memberEmails) && memberEmails.length > 0) {
       const [userRows] = await conn.query(
         `
@@ -2066,10 +2103,52 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
         );
 
         members = userList.map((u) => u.email);
+        memberIds = userList.map((u) => u.id);
       }
     }
 
     await conn.commit();
+
+    // 3) 🔔 Notificación: nuevo foro
+    try {
+      let recipients = [];
+
+      if (isPublic) {
+        // foro público -> avisar a admin + root
+        const [adminRows] = await pool.query(
+          `
+            SELECT u.id
+            FROM users u
+            JOIN roles r ON r.id = u.role_id
+            WHERE r.name IN ('admin','root')
+          `,
+        );
+        const adminList = Array.isArray(adminRows) ? adminRows : [];
+        recipients = adminList.map((u) => u.id);
+      } else {
+        // foro privado -> avisar solo a los miembros
+        recipients = memberIds;
+      }
+
+      if (createdBy) {
+        recipients = recipients.filter((id) => id !== createdBy);
+      }
+
+      if (recipients.length) {
+        await createNotificationWithRecipients({
+          typeName: 'foro_nuevo',
+          title: 'Nuevo foro creado',
+          body: isPublic
+            ? `Se creó un nuevo foro público: "${title}".`
+            : `Se creó un nuevo foro privado: "${title}".`,
+          createdBy,
+          recipients,
+          forumId,
+        });
+      }
+    } catch (notifyErr) {
+      console.error('Error creando notificación de foro nuevo:', notifyErr);
+    }
 
     return res.status(201).json({
       id: forumId,
@@ -2087,6 +2166,7 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
     conn.release();
   }
 });
+
 
 // Listar foros (admin/root)
 // GET /api/forums
@@ -2240,10 +2320,17 @@ api.post('/forums/:id/posts-with-file', requireAnyAuthenticated, async (req, res
 
   try {
     // Verificar que el foro exista
-    const [forumRows] = await pool.query('SELECT id FROM forums WHERE id = ? LIMIT 1', [forumId]);
-    if (!Array.isArray(forumRows) || forumRows.length === 0) {
-      return res.status(404).json({ message: 'Foro no encontrado' });
-    }
+const [forumRows] = await pool.query(
+  'SELECT id, title FROM forums WHERE id = ? LIMIT 1',
+  [forumId],
+);
+
+if (!Array.isArray(forumRows) || forumRows.length === 0) {
+  return res.status(404).json({ message: 'Foro no encontrado' });
+}
+
+const forumTitle = forumRows[0].title || `Foro #${forumId}`;
+
 
     const body = text.toString().trim();
 
@@ -2296,6 +2383,28 @@ api.post('/forums/:id/posts-with-file', requireAnyAuthenticated, async (req, res
       const role = uList.length ? uList[0].role : 'usuario';
 
       await conn.commit();
+            // 🔔 Notificación: nuevo mensaje en foro (con archivo)
+            try {
+              const recipients = await getForumNotificationRecipients(forumId, userId);
+              if (recipients.length) {
+                await createNotificationWithRecipients({
+                  typeName: 'foro_mensaje',
+                  title: `Nuevo mensaje en "${forumTitle}"`,
+                  body: body
+                    ? `${authorName} escribió: "${body}"`
+                    : `${authorName} publicó un archivo en el foro "${forumTitle}".`,
+                  createdBy: userId,
+                  recipients,
+                  forumId,
+                });
+              }
+            } catch (notifyErr) {
+              console.error(
+                'Error creando notificación de post con archivo en foro:',
+                notifyErr,
+              );
+            }
+
 
       const isAdmin = ['admin', 'root'].includes(String(role).toLowerCase());
 
@@ -2388,10 +2497,16 @@ api.post('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
     }
 
     // Verificamos que el foro exista
-    const [forumRows] = await pool.query('SELECT id FROM forums WHERE id = ? LIMIT 1', [forumId]);
-    if (!Array.isArray(forumRows) || forumRows.length === 0) {
-      return res.status(404).json({ message: 'Foro no encontrado' });
-    }
+const [forumRows] = await pool.query(
+  'SELECT id, title FROM forums WHERE id = ? LIMIT 1',
+  [forumId],
+);
+
+if (!Array.isArray(forumRows) || forumRows.length === 0) {
+  return res.status(404).json({ message: 'Foro no encontrado' });
+}
+
+const forumTitle = forumRows[0].title || `Foro #${forumId}`;
 
     const body = text.toString().trim();
 
@@ -2425,7 +2540,6 @@ api.post('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
       `,
       [postId],
     );
-
     const list = Array.isArray(rows) ? rows : [];
     if (!list.length) {
       return res
@@ -2433,7 +2547,27 @@ api.post('/forums/:id/posts', requireAnyAuthenticated, async (req, res) => {
         .json({ message: 'No se pudo recuperar el mensaje creado' });
     }
 
-    return res.status(201).json(list[0]);
+    const post = list[0];
+
+    // 🔔 Notificación: nuevo mensaje en foro (texto)
+    try {
+      const recipients = await getForumNotificationRecipients(forumId, userId);
+      if (recipients.length) {
+        await createNotificationWithRecipients({
+          typeName: 'foro_mensaje',
+          title: `Nuevo mensaje en "${forumTitle}"`,
+          body: `${post.author} escribió: "${body}"`,
+          createdBy: userId,
+          recipients,
+          forumId,
+        });
+      }
+    } catch (notifyErr) {
+      console.error('Error creando notificación de mensaje en foro:', notifyErr);
+    }
+
+    return res.status(201).json(post);
+
   } catch (err) {
     console.error('Error creando mensaje del foro:', err);
     return res.status(500).json({ message: 'Error al crear mensaje' });
