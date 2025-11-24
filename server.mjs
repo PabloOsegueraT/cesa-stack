@@ -2909,6 +2909,38 @@ api.delete('/forums/:id', requireAdminOrRoot, async (req, res) => {
   }
 });
 
+// Registrar / actualizar token FCM del dispositivo actual
+// POST /api/devices/register
+// Body: { token: string, platform?: string }
+api.post('/devices/register', requireAnyAuthenticated, async (req, res) => {
+  try {
+    const userId = req.authUserId;
+    const { token, platform } = req.body ?? {};
+
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ message: 'token requerido' });
+    }
+
+    // upsert sencillo: si ya existe (user_id, fcm_token), solo marcamos activo y actualizamos last_seen
+    await pool.query(
+      `
+      INSERT INTO user_devices (user_id, fcm_token, platform)
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        is_active = 1,
+        last_seen_at = CURRENT_TIMESTAMP,
+        platform = VALUES(platform)
+      `,
+      [userId, token, platform || null],
+    );
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en POST /api/devices/register', err);
+    return res.status(500).json({ message: 'Error interno' });
+  }
+});
+
 /* ========================
  *  Montaje y 404 JSON
  * ====================== */
