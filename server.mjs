@@ -254,18 +254,45 @@ async function createNotificationWithRecipients({
 // Destinatarios de notificaciones de foro:
 // - Si hay miembros en forum_members -> ellos (menos el autor)
 // - Si no hay miembros (foro público) -> admin + root (menos el autor)
+// Destinatarios de notificaciones de foro:
+// - Foros públicos: TODOS los usuarios activos (usuario, admin, root) menos el autor
+// - Foros privados: miembros del foro + admin + root (menos el autor)
 async function getForumNotificationRecipients(forumId, excludeUserId = null) {
-  const [memRows] = await pool.query(
-    `
-      SELECT user_id
-      FROM forum_members
-      WHERE forum_id = ?
-    `,
+  // 1) Saber si el foro es público
+  const [forumRows] = await pool.query(
+    'SELECT is_public FROM forums WHERE id = ? LIMIT 1',
     [forumId],
   );
-  let ids = Array.isArray(memRows) ? memRows.map((r) => r.user_id) : [];
+  const fList = Array.isArray(forumRows) ? forumRows : [];
+  if (!fList.length) return [];
 
-  if (!ids.length) {
+  const isPublic = fList[0].is_public === 1;
+  let ids = [];
+
+  if (isPublic) {
+    // 👉 foro público → todos los usuarios activos (usuario, admin, root)
+    const [rows] = await pool.query(
+      `
+        SELECT u.id
+        FROM users u
+        JOIN roles r ON r.id = u.role_id
+        WHERE u.is_active = 1
+          AND r.name IN ('usuario','admin','root')
+      `,
+    );
+    ids = Array.isArray(rows) ? rows.map((r) => r.id) : [];
+  } else {
+    // 👉 foro privado → miembros + admin + root
+    const [memRows] = await pool.query(
+      `
+        SELECT user_id
+        FROM forum_members
+        WHERE forum_id = ?
+      `,
+      [forumId],
+    );
+    ids = Array.isArray(memRows) ? memRows.map((r) => r.user_id) : [];
+
     const [adminRows] = await pool.query(
       `
         SELECT u.id
@@ -274,9 +301,11 @@ async function getForumNotificationRecipients(forumId, excludeUserId = null) {
         WHERE r.name IN ('admin','root')
       `,
     );
-    ids = Array.isArray(adminRows) ? adminRows.map((r) => r.id) : [];
+    const extra = Array.isArray(adminRows) ? adminRows.map((r) => r.id) : [];
+    ids = ids.concat(extra);
   }
 
+  // Quitar autor si lo mandamos
   if (excludeUserId) {
     ids = ids.filter((id) => id !== excludeUserId);
   }
@@ -1137,27 +1166,73 @@ api.post('/tasks', requireAdminOrRoot, async (req, res) => {
         [taskId, createdBy, statusId],
       );
 
-      await conn.commit();
+                   await conn.commit();
 
-      // ✅ 4) NOTIFICACIÓN: si hay assigneeId, le avisamos
-      if (assigneeId) {
-        try {
-          const dueText = dueDate ? ` con fecha límite ${dueDate}` : '';
-          await createNotificationWithRecipients({
-            typeName: 'actividad_tarea', // se crea solo si no existe
-            title: 'Nueva tarea asignada',
-            body: `Se te ha asignado la tarea "${title}"${dueText}.`,
-            createdBy,
-            recipients: [assigneeId],
-            taskId,
-          });
-        } catch (notifyErr) {
-          console.error(
-            'Error creando notificación de asignación de tarea:',
-            notifyErr,
-          );
-        }
-      }
+                   // 🔔 Notificaciones de asignación de tarea
+                   try {
+                     // Nombre del creador
+                     let creatorName = 'Alguien';
+                     if (createdBy) {
+                       const [uRows] = await pool.query(
+                         'SELECT name FROM users WHERE id = ? LIMIT 1',
+                         [createdBy],
+                       );
+                       const uList = Array.isArray(uRows) ? uRows : [];
+                       if (uList.length) creatorName = uList[0].name;
+                     }
+
+                     const dueText = dueDate ? ` con fecha límite ${dueDate}` : '';
+
+                     // 1) Notificación al asignado (USUARIO)
+                     if (assigneeId) {
+                       await createNotificationWithRecipients({
+                         typeName: 'actividad_tarea',
+                         title: 'Nueva tarea asignada',
+                         body: `Se te ha asignado la tarea "${title}"${dueText}.`,
+                         createdBy,
+                         recipients: [assigneeId],
+                         taskId,
+                       });
+                     }
+
+                     // 2) Notificación a ADMIN + ROOT
+                     const [adminRows] = await pool.query(`
+                       SELECT u.id
+                       FROM users u
+                       JOIN roles r ON r.id = u.role_id
+                       WHERE r.name IN ('admin','root')
+                     `);
+                     let adminIds = Array.isArray(adminRows)
+                       ? adminRows.map((r) => r.id)
+                       : [];
+
+                     if (createdBy) {
+                       adminIds = adminIds.filter((id) => id !== createdBy);
+                     }
+
+                     if (adminIds.length) {
+                       const assignedText =
+                         assigneeName && assigneeName !== 'Sin asignar'
+                           ? ` asignada a ${assigneeName}`
+                           : ' (sin asignar)';
+
+                       await createNotificationWithRecipients({
+                         typeName: 'actividad_tarea',
+                         title: 'Nueva tarea creada',
+                         body: `${creatorName} creó la tarea "${title}"${assignedText}${dueText}.`,
+                         createdBy,
+                         recipients: adminIds,
+                         taskId,
+                       });
+                     }
+                   } catch (notifyErr) {
+                     console.error(
+                       'Error creando notificaciones de asignación de tarea:',
+                       notifyErr,
+                     );
+                   }
+
+
 
       // Respuesta alineada con Task.fromJson
       return res.status(201).json({
@@ -1993,14 +2068,88 @@ api.post('/tasks/:id/comments', requireAnyAuthenticated, async (req, res) => {
       [userId, commentId],
     );
 
-    const list = Array.isArray(rows) ? rows : [];
-    if (!list.length) {
-      return res
-        .status(500)
-        .json({ message: 'No se pudo recuperar el comentario creado' });
-    }
+      const list = Array.isArray(rows) ? rows : [];
+      if (!list.length) {
+        return res
+          .status(500)
+          .json({ message: 'No se pudo recuperar el comentario creado' });
+      }
 
-    return res.status(201).json(list[0]);
+      const comment = list[0];
+
+      // 🔔 Notificación: nuevo comentario en tarea
+      try {
+        // Título de la tarea
+        const [taskRows2] = await pool.query(
+          'SELECT title FROM tasks WHERE id = ? LIMIT 1',
+          [taskId],
+        );
+        const tList = Array.isArray(taskRows2) ? taskRows2 : [];
+        const taskTitle =
+          tList.length && tList[0].title
+            ? tList[0].title
+            : `Tarea #${taskId}`;
+
+        // Nombre del autor
+        const [userRows] = await pool.query(
+          'SELECT name FROM users WHERE id = ? LIMIT 1',
+          [userId],
+        );
+        const uList = Array.isArray(userRows) ? userRows : [];
+        const authorName = uList.length ? uList[0].name : 'Usuario';
+
+        // Usuarios asignados a la tarea
+        const [assRows] = await pool.query(
+          `
+          SELECT DISTINCT ta.user_id AS id
+          FROM task_assignments ta
+          WHERE ta.task_id = ? AND ta.is_active = 1
+          `,
+          [taskId],
+        );
+        let recipients = Array.isArray(assRows)
+          ? assRows.map((r) => r.id)
+          : [];
+
+        // + ADMIN y ROOT
+        const [adminRows] = await pool.query(
+          `
+          SELECT u.id
+          FROM users u
+          JOIN roles r ON r.id = u.role_id
+          WHERE r.name IN ('admin','root')
+          `,
+        );
+        const adminIds = Array.isArray(adminRows)
+          ? adminRows.map((r) => r.id)
+          : [];
+
+        recipients = recipients.concat(adminIds);
+
+        // Quitar autor y duplicados
+        recipients = [...new Set(recipients)].filter((id) => id !== userId);
+
+        if (recipients.length) {
+          const preview =
+            text.length > 80 ? `${text.slice(0, 80)}…` : text;
+          await createNotificationWithRecipients({
+            typeName: 'actividad_tarea',
+            title: 'Nuevo comentario en tarea',
+            body: `${authorName} comentó en la tarea "${taskTitle}": "${preview}"`,
+            createdBy: userId,
+            recipients,
+            taskId,
+          });
+        }
+      } catch (notifyErr) {
+        console.error(
+          'Error creando notificación de comentario de tarea:',
+          notifyErr,
+        );
+      }
+
+      return res.status(201).json(comment);
+
   } catch (err) {
     console.error('Error creando comentario de tarea:', err);
     return res.status(500).json({ message: 'Error al crear comentario' });
@@ -2107,81 +2256,41 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
       }
     }
 
-    await conn.commit();
+        await conn.commit();
 
-    // ==============================
-    // 3) 🔔 Notificación: nuevo foro
-    // ==============================
-    try {
-      // 3.1) Admins + root SIEMPRE reciben algo
-      const [adminRows] = await pool.query(
-        `
-          SELECT u.id
-          FROM users u
-          JOIN roles r ON r.id = u.role_id
-          WHERE r.name IN ('admin','root')
-        `,
-      );
-      const adminIds = (Array.isArray(adminRows) ? adminRows : []).map((u) => u.id);
+        // 3) 🔔 Notificación: nuevo foro (usuarios + admins + root)
+        try {
+          // Nombre del creador
+          let creatorName = 'Alguien';
+          if (createdBy) {
+            const [uRows] = await pool.query(
+              'SELECT name FROM users WHERE id = ? LIMIT 1',
+              [createdBy],
+            );
+            const uList = Array.isArray(uRows) ? uRows : [];
+            if (uList.length) creatorName = uList[0].name;
+          }
 
-      // 3.2) Usuarios normales según el tipo de foro
-      let userIds = [];
+          const recipients = await getForumNotificationRecipients(forumId, createdBy);
 
-      if (isPublic) {
-        // Foro para todos: todos los usuarios con rol "usuario" activos
-        const [userRows] = await pool.query(
-          `
-            SELECT u.id
-            FROM users u
-            JOIN roles r ON r.id = u.role_id
-            WHERE r.name = 'usuario'
-              AND u.is_active = 1
-          `,
-        );
-        userIds = (Array.isArray(userRows) ? userRows : []).map((u) => u.id);
-      } else {
-        // Foro privado: solo los miembros que agregaste por correo
-        userIds = memberIds;
-      }
-
-      // Unimos admin/root + usuarios (sin duplicados)
-      let recipients = [...new Set([...adminIds, ...userIds])];
-
-      // No nos notificamos al creador si viene el id
-      if (createdBy) {
-        recipients = recipients.filter((id) => id !== createdBy);
-      }
-
-      if (recipients.length) {
-        // Nombre del creador para el mensaje
-        let creatorName = 'Alguien';
-        if (createdBy) {
-          const [nameRows] = await pool.query(
-            'SELECT name FROM users WHERE id = ? LIMIT 1',
-            [createdBy],
-          );
-          const nameList = Array.isArray(nameRows) ? nameRows : [];
-          if (nameList.length) creatorName = nameList[0].name;
+          if (recipients.length) {
+            await createNotificationWithRecipients({
+              typeName: 'foro_nuevo',
+              title: 'Nuevo foro creado',
+              body: isPublic
+                  ? `${creatorName} creó el foro público "${title}".`
+                  : `${creatorName} creó el foro privado "${title}".`,
+              createdBy,
+              recipients,
+              forumId,
+            });
+          }
+        } catch (notifyErr) {
+          console.error('Error creando notificación de foro nuevo:', notifyErr);
         }
 
-        await createNotificationWithRecipients({
-          typeName: 'foro_nuevo',
-          title: isPublic
-            ? 'Nuevo foro público'
-            : 'Nuevo foro privado',
-          body: isPublic
-            ? `${creatorName} creó el foro público "${title}".`
-            : `${creatorName} te agregó al foro privado "${title}".`,
-          createdBy,
-          recipients,
-          forumId,
-        });
-      }
-    } catch (notifyErr) {
-      console.error('Error creando notificación de foro nuevo:', notifyErr);
-    }
+        return res.status(201).json({
 
-    return res.status(201).json({
       id: forumId,
       title,
       description,
@@ -2733,113 +2842,71 @@ api.put('/forums/:id', requireAdminOrRoot, async (req, res) => {
   }
 });
 
-// DELETE /api/forums/:id  -> admin o root pueden borrar el foro y sus mensajes
+// {}DELETE /api/forums/:id  -> admin o root pueden borrar el foro y sus mensajes
 // Además envía notificación a admin/root + miembros
+// DELETE /api/forums/:id  -> admin o root pueden borrar el foro y sus mensajes
 api.delete('/forums/:id', requireAdminOrRoot, async (req, res) => {
-  const forumId = Number(req.params.id);
-  if (!forumId) {
-    return res.status(400).json({ message: 'id inválido' });
-  }
-
-  const headerUserId = Number(req.header('x-user-id'));
-  const actorId = Number.isFinite(headerUserId) ? headerUserId : null;
-
-  let forumTitle = '';
-  let recipients = [];
-
-  const conn = await pool.getConnection();
   try {
-    await conn.beginTransaction();
+    const forumId = Number(req.params.id);
+    if (!forumId) {
+      return res.status(400).json({ message: 'id inválido' });
+    }
 
-    // 1) Info del foro
-    const [forumRows] = await conn.query(
-      'SELECT id, title FROM forums WHERE id = ? FOR UPDATE',
+    const headerUserId = Number(req.header('x-user-id'));
+    const actorId = Number.isFinite(headerUserId) ? headerUserId : null;
+
+    // 1) Datos del foro
+    const [rows] = await pool.query(
+      'SELECT title FROM forums WHERE id = ? LIMIT 1',
       [forumId],
     );
-    const forumList = Array.isArray(forumRows) ? forumRows : [];
-    if (!forumList.length) {
-      await conn.rollback();
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
       return res.status(404).json({ message: 'Foro no encontrado' });
     }
-    forumTitle = forumList[0].title || `Foro #${forumId}`;
+    const forumTitle = list[0].title || `Foro #${forumId}`;
 
-    // 2) Miembros del foro (si es privado)
-    const [memberRows] = await conn.query(
-      'SELECT user_id FROM forum_members WHERE forum_id = ?',
-      [forumId],
-    );
-    const memberIds = (Array.isArray(memberRows) ? memberRows : []).map(
-      (r) => r.user_id,
-    );
-
-    // 3) Admin + root
-    const [adminRows] = await conn.query(
-      `
-        SELECT u.id
-        FROM users u
-        JOIN roles r ON r.id = u.role_id
-        WHERE r.name IN ('admin','root')
-      `,
-    );
-    const adminIds = (Array.isArray(adminRows) ? adminRows : []).map(
-      (r) => r.id,
-    );
-
-    // 4) Recipientes = miembros + admin/root (sin duplicados)
-    recipients = [...new Set([...memberIds, ...adminIds])];
+    // 2) Nombre del que borra
+    let actorName = 'Alguien';
     if (actorId) {
-      recipients = recipients.filter((id) => id !== actorId);
+      const [uRows] = await pool.query(
+        'SELECT name FROM users WHERE id = ? LIMIT 1',
+        [actorId],
+      );
+      const uList = Array.isArray(uRows) ? uRows : [];
+      if (uList.length) actorName = uList[0].name;
     }
 
-    // 5) Borrar el foro
-    const [result] = await conn.query(
+    // 3) Destinatarios ANTES de borrar
+    const recipients = await getForumNotificationRecipients(forumId, actorId);
+
+    // 4) Borrar foro
+    const [result] = await pool.execute(
       'DELETE FROM forums WHERE id = ? LIMIT 1',
       [forumId],
     );
-    if (!result.affectedRows) {
-      await conn.rollback();
+
+    if (result.affectedRows === 0) {
       return res.status(404).json({ message: 'Foro no encontrado' });
     }
 
-    await conn.commit();
-  } catch (err) {
-    await conn.rollback();
-    console.error('Error borrando foro', err);
-    return res
-      .status(500)
-      .json({ message: 'Error interno al eliminar foro' });
-  } finally {
-    conn.release();
-  }
-
-  // 6) Notificación después de la eliminación
-  try {
+    // 5) Notificación de eliminación (sin forum_id por FK)
     if (recipients.length) {
-      let actorName = 'Alguien';
-      if (actorId) {
-        const [uRows] = await pool.query(
-          'SELECT name FROM users WHERE id = ? LIMIT 1',
-          [actorId],
-        );
-        const uList = Array.isArray(uRows) ? uRows : [];
-        if (uList.length) actorName = uList[0].name;
-      }
-
       await createNotificationWithRecipients({
         typeName: 'foro_eliminado',
         title: 'Foro eliminado',
         body: `${actorName} eliminó el foro "${forumTitle}".`,
         createdBy: actorId,
         recipients,
-        forumId: null,     // ✅ ya no referencia a un foro borrado
+        forumId: null, // 🔴 importante, para no violar FK
       });
-
     }
-  } catch (notifyErr) {
-    console.error('Error creando notificación de foro eliminado:', notifyErr);
-  }
 
-  return res.json({ ok: true });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Error borrando foro', err);
+    return res.status(500).json({ message: 'Error interno al eliminar foro' });
+  }
 });
 
 /* ========================
