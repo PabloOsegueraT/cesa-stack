@@ -2109,38 +2109,69 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
 
     await conn.commit();
 
+    // ==============================
     // 3) 🔔 Notificación: nuevo foro
+    // ==============================
     try {
-      let recipients = [];
+      // 3.1) Admins + root SIEMPRE reciben algo
+      const [adminRows] = await pool.query(
+        `
+          SELECT u.id
+          FROM users u
+          JOIN roles r ON r.id = u.role_id
+          WHERE r.name IN ('admin','root')
+        `,
+      );
+      const adminIds = (Array.isArray(adminRows) ? adminRows : []).map((u) => u.id);
+
+      // 3.2) Usuarios normales según el tipo de foro
+      let userIds = [];
 
       if (isPublic) {
-        // foro público -> avisar a admin + root
-        const [adminRows] = await pool.query(
+        // Foro para todos: todos los usuarios con rol "usuario" activos
+        const [userRows] = await pool.query(
           `
             SELECT u.id
             FROM users u
             JOIN roles r ON r.id = u.role_id
-            WHERE r.name IN ('admin','root')
+            WHERE r.name = 'usuario'
+              AND u.is_active = 1
           `,
         );
-        const adminList = Array.isArray(adminRows) ? adminRows : [];
-        recipients = adminList.map((u) => u.id);
+        userIds = (Array.isArray(userRows) ? userRows : []).map((u) => u.id);
       } else {
-        // foro privado -> avisar solo a los miembros
-        recipients = memberIds;
+        // Foro privado: solo los miembros que agregaste por correo
+        userIds = memberIds;
       }
 
+      // Unimos admin/root + usuarios (sin duplicados)
+      let recipients = [...new Set([...adminIds, ...userIds])];
+
+      // No nos notificamos al creador si viene el id
       if (createdBy) {
         recipients = recipients.filter((id) => id !== createdBy);
       }
 
       if (recipients.length) {
+        // Nombre del creador para el mensaje
+        let creatorName = 'Alguien';
+        if (createdBy) {
+          const [nameRows] = await pool.query(
+            'SELECT name FROM users WHERE id = ? LIMIT 1',
+            [createdBy],
+          );
+          const nameList = Array.isArray(nameRows) ? nameRows : [];
+          if (nameList.length) creatorName = nameList[0].name;
+        }
+
         await createNotificationWithRecipients({
           typeName: 'foro_nuevo',
-          title: 'Nuevo foro creado',
+          title: isPublic
+            ? 'Nuevo foro público'
+            : 'Nuevo foro privado',
           body: isPublic
-            ? `Se creó un nuevo foro público: "${title}".`
-            : `Se creó un nuevo foro privado: "${title}".`,
+            ? `${creatorName} creó el foro público "${title}".`
+            : `${creatorName} te agregó al foro privado "${title}".`,
           createdBy,
           recipients,
           forumId,
@@ -2166,7 +2197,6 @@ api.post('/forums', requireAdminOrRoot, async (req, res) => {
     conn.release();
   }
 });
-
 
 // Listar foros (admin/root)
 // GET /api/forums
@@ -2576,24 +2606,111 @@ const forumTitle = forumRows[0].title || `Foro #${forumId}`;
 
 
 // DELETE /api/forums/:id  -> admin o root pueden borrar el foro y sus mensajes
+// Además envía notificación a admin/root + miembros
 api.delete('/forums/:id', requireAdminOrRoot, async (req, res) => {
-  try {
-    const forumId = req.params.id;
+  const forumId = Number(req.params.id);
+  if (!forumId) {
+    return res.status(400).json({ message: 'id inválido' });
+  }
 
-    const [result] = await pool.execute(
+  const headerUserId = Number(req.header('x-user-id'));
+  const actorId = Number.isFinite(headerUserId) ? headerUserId : null;
+
+  let forumTitle = '';
+  let recipients = [];
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // 1) Info del foro
+    const [forumRows] = await conn.query(
+      'SELECT id, title FROM forums WHERE id = ? FOR UPDATE',
+      [forumId],
+    );
+    const forumList = Array.isArray(forumRows) ? forumRows : [];
+    if (!forumList.length) {
+      await conn.rollback();
+      return res.status(404).json({ message: 'Foro no encontrado' });
+    }
+    forumTitle = forumList[0].title || `Foro #${forumId}`;
+
+    // 2) Miembros del foro (si es privado)
+    const [memberRows] = await conn.query(
+      'SELECT user_id FROM forum_members WHERE forum_id = ?',
+      [forumId],
+    );
+    const memberIds = (Array.isArray(memberRows) ? memberRows : []).map(
+      (r) => r.user_id,
+    );
+
+    // 3) Admin + root
+    const [adminRows] = await conn.query(
+      `
+        SELECT u.id
+        FROM users u
+        JOIN roles r ON r.id = u.role_id
+        WHERE r.name IN ('admin','root')
+      `,
+    );
+    const adminIds = (Array.isArray(adminRows) ? adminRows : []).map(
+      (r) => r.id,
+    );
+
+    // 4) Recipientes = miembros + admin/root (sin duplicados)
+    recipients = [...new Set([...memberIds, ...adminIds])];
+    if (actorId) {
+      recipients = recipients.filter((id) => id !== actorId);
+    }
+
+    // 5) Borrar el foro
+    const [result] = await conn.query(
       'DELETE FROM forums WHERE id = ? LIMIT 1',
       [forumId],
     );
-
-    if (result.affectedRows === 0) {
+    if (!result.affectedRows) {
+      await conn.rollback();
       return res.status(404).json({ message: 'Foro no encontrado' });
     }
 
-    return res.json({ ok: true });
+    await conn.commit();
   } catch (err) {
+    await conn.rollback();
     console.error('Error borrando foro', err);
-    return res.status(500).json({ message: 'Error interno al eliminar foro' });
+    return res
+      .status(500)
+      .json({ message: 'Error interno al eliminar foro' });
+  } finally {
+    conn.release();
   }
+
+  // 6) Notificación después de la eliminación
+  try {
+    if (recipients.length) {
+      let actorName = 'Alguien';
+      if (actorId) {
+        const [uRows] = await pool.query(
+          'SELECT name FROM users WHERE id = ? LIMIT 1',
+          [actorId],
+        );
+        const uList = Array.isArray(uRows) ? uRows : [];
+        if (uList.length) actorName = uList[0].name;
+      }
+
+      await createNotificationWithRecipients({
+        typeName: 'foro_eliminado',
+        title: 'Foro eliminado',
+        body: `${actorName} eliminó el foro "${forumTitle}".`,
+        createdBy: actorId,
+        recipients,
+        forumId,
+      });
+    }
+  } catch (notifyErr) {
+    console.error('Error creando notificación de foro eliminado:', notifyErr);
+  }
+
+  return res.json({ ok: true });
 });
 
 /* ========================
